@@ -1385,6 +1385,12 @@ async def read_json(request):
     except Exception:
         return None
 
+async def http_health(request):
+    return web.json_response({"ok": True, "service": "photoforge"})
+
+async def http_favicon(request):
+    return web.Response(status=204)
+
 async def http_index(request):
     return web.Response(text=PREMIUM_HTML, content_type="text/html", charset="utf-8",
                         headers={"Cache-Control": "no-store"})
