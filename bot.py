@@ -1,26 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Photo Studio Pro — Premium Photo Editing Web Application
-=========================================================
-Single-file production application:
-  • aiogram 3.x Telegram bot (passport photo maker — preserved)
-  • aiohttp web server with full premium UI
-  • Email/password authentication with sessions
-  • Premium dashboard with comprehensive photo editor
-  • Complete admin panel (access control, bans, maintenance, settings)
-  • Pillow-based professional image processing pipeline
+Telegram Passport Photo Printing Bot
+====================================
+Single-file production bot: aiogram 3.x + Pillow + numpy + optional rembg
+background removal + embedded Telegram Mini App served via aiohttp.
 
 Required environment variables:
     BOT_TOKEN   - Telegram bot token from @BotFather
-    SECRET_KEY  - Secret key for session tokens (auto-generated if missing)
 
 Optional environment variables:
-    WEBAPP_URL  - public HTTPS URL of this service
-    OWNER_ID    - numeric Telegram id of the owner (auto-promoted to admin)
-    PORT        - HTTP port for the aiohttp server
-    DATABASE_PATH - path to SQLite database (default: ./photostudio.db)
-    ADMIN_EMAIL - email of the initial admin account (created on first run)
-    ADMIN_PASSWORD - password for the initial admin account
+    WEBAPP_URL  - public HTTPS URL of this service (Railway domain). If set,
+                  the "Open Photo Maker" Mini App button is shown.
+    OWNER_ID    - numeric Telegram id of the owner (reserved, optional)
+    PORT        - HTTP port for the aiohttp server (Railway provides it)
 """
 
 import asyncio
@@ -33,19 +25,21 @@ import logging
 import math
 import os
 import re
-import secrets
 import shutil
-import sqlite3
 import tempfile
 import time
 import uuid
 import zipfile
 from urllib.parse import parse_qsl
 from pathlib import Path
-from datetime import datetime, timedelta
+import sqlite3
+import secrets
+import base64
+from datetime import datetime, timezone
+from email.utils import parseaddr
 
 import numpy as np
-from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -65,10 +59,13 @@ from aiogram.types import (
     WebAppInfo,
 )
 
-# Optional advanced background removal
+# Optional advanced background removal. It is loaded lazily so Render can bind
+# its HTTP port immediately instead of waiting for the ONNX model at boot.
 _rembg_remove = None
 _REMBG_CHECKED = False
 REMBG_AVAILABLE = False
+
+
 _rembg_session = None
 
 
@@ -81,17 +78,17 @@ def _load_rembg() -> bool:
         from rembg import remove, new_session
         _rembg_remove = remove
         try:
+            # u2netp = small model (~4 MB), safe for 512 MB Render instances
             _rembg_session = new_session("u2netp")
         except Exception:
             _rembg_session = None
         REMBG_AVAILABLE = True
     except Exception:
-        logging.getLogger("photo-studio").warning(
+        logging.getLogger("passport-bot").warning(
             "rembg not available - using fallback", exc_info=True)
         _rembg_remove = None
         REMBG_AVAILABLE = False
     return REMBG_AVAILABLE
-
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -100,31 +97,29 @@ def _load_rembg() -> bool:
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip().rstrip("/")
 OWNER_ID = os.getenv("OWNER_ID", "").strip()
-SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
-DATABASE_PATH = os.getenv("DATABASE_PATH", "photostudio.db")
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "").strip().lower()
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
-
-
 def _read_port() -> int:
     raw = os.getenv("PORT", "8080").strip()
     try:
         port = int(raw)
     except ValueError:
+        logging.getLogger("passport-bot").warning("Invalid PORT=%r; using 8080", raw)
         return 8080
     return port if 1 <= port <= 65535 else 8080
 
 
 PORT = _read_port()
 
-DPI = 300
-MARGIN_MM = 10.0
-SPACING_MM = 1.5
-BORDER_RGB = (0, 0, 0)
-BORDER_MM = 0.5
-RMBG_MAX_SIDE = 1400
+DPI = 300                      # print quality
+MARGIN_MM = 10.0               # page margin (top / left / right / bottom)
+SPACING_MM = 1.5               # small gap between photos (tight row layout)
+BORDER_RGB = (0, 0, 0)         # black border around each photo
+BORDER_MM = 0.5                # border thickness (drawn INSIDE photo size)
+RMBG_MAX_SIDE = 1400           # downscale before rembg -> avoids Render OOM
+# rembg (AI cut-out) is OPT-IN: set env USE_REMBG=1 only on instances with
+# >= 1 GB RAM. By default a fast, memory-safe built-in method is used, so the
+# bot can never hang or crash while changing the background.
 USE_REMBG = os.getenv("USE_REMBG", "0").strip() in ("1", "true", "yes")
-GENERATION_TIMEOUT = 150
+GENERATION_TIMEOUT = 150       # seconds before the bot gives up and reports
 JPEG_QUALITY = 95
 
 MAX_QTY = 500
@@ -157,12 +152,12 @@ BG_PRESETS = {
 }
 
 HEX_RE = re.compile(r"^#?[0-9a-fA-F]{6}$")
-EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
 IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/bmp", "image/tiff"}
 
-TMP_ROOT = Path(tempfile.gettempdir()) / "photo_studio"
+TMP_ROOT = Path(tempfile.gettempdir()) / "passport_photo_bot"
 TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
+# Protect the public Mini App endpoint from accidental overload on small Render instances.
 try:
     GENERATION_CONCURRENCY = max(1, int(os.getenv("GENERATION_CONCURRENCY", "1") or "1"))
 except ValueError:
@@ -170,336 +165,12 @@ except ValueError:
 _generation_semaphore = asyncio.Semaphore(GENERATION_CONCURRENCY)
 _started_at = time.time()
 _generation_count = 0
-log = logging.getLogger("photo-studio")
-_bot = None
+log = logging.getLogger("passport-bot")
+_bot = None  # set in main(); used by the Mini App to deliver files in chat
 
-SESSION_DURATION = 7 * 24 * 3600  # 7 days
-PREVIEW_MAX_SIDE = 1200  # preview image max dimension
-
-
-# --------------------------------------------------------------------------- #
-# Database
-# --------------------------------------------------------------------------- #
-
-_db_path = DATABASE_PATH
-
-
-def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(_db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
-
-
-def init_db():
-    conn = _db()
-    try:
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            password_salt TEXT NOT NULL,
-            display_name TEXT DEFAULT '',
-            created_at REAL NOT NULL,
-            last_login REAL DEFAULT 0,
-            is_active INTEGER DEFAULT 1,
-            is_admin INTEGER DEFAULT 0,
-            has_bot_access INTEGER DEFAULT 1,
-            is_banned INTEGER DEFAULT 0,
-            banned_reason TEXT DEFAULT '',
-            telegram_id INTEGER DEFAULT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS sessions (
-            token TEXT PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            created_at REAL NOT NULL,
-            expires_at REAL NOT NULL,
-            ip_address TEXT DEFAULT '',
-            user_agent TEXT DEFAULT '',
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS activity_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            action TEXT NOT NULL,
-            details TEXT DEFAULT '',
-            ip_address TEXT DEFAULT '',
-            timestamp REAL NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS system_settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at REAL NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS usage_stats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            file_count INTEGER DEFAULT 0,
-            timestamp REAL NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
-        CREATE INDEX IF NOT EXISTS idx_activity_user ON activity_logs(user_id);
-        CREATE INDEX IF NOT EXISTS idx_usage_user ON usage_stats(user_id);
-        """)
-        conn.commit()
-
-        # Default settings
-        defaults = {
-            "maintenance_mode": "0",
-            "maintenance_message": "We are performing scheduled maintenance. Please check back soon.",
-            "feature_passport_maker": "1",
-            "feature_photo_editor": "1",
-            "feature_background_removal": "1",
-            "feature_filters": "1",
-            "feature_pdf_export": "1",
-            "feature_custom_dimensions": "1",
-            "feature_batch_printing": "1",
-            "max_upload_mb": "25",
-            "site_name": "Photo Studio Pro",
-            "registration_open": "1",
-        }
-        for k, v in defaults.items():
-            conn.execute(
-                "INSERT OR IGNORE INTO system_settings (key, value, updated_at) VALUES (?,?,?)",
-                (k, v, time.time()))
-        conn.commit()
-
-        # Auto-create admin account
-        if ADMIN_EMAIL and ADMIN_PASSWORD:
-            row = conn.execute("SELECT id FROM users WHERE email=?", (ADMIN_EMAIL,)).fetchone()
-            if row is None:
-                salt = secrets.token_hex(16)
-                phash = _hash_password(ADMIN_PASSWORD, salt)
-                conn.execute(
-                    "INSERT INTO users (email, password_hash, password_salt, display_name, "
-                    "created_at, is_active, is_admin, has_bot_access) VALUES (?,?,?,?,?,?,1,1)",
-                    (ADMIN_EMAIL, phash, salt, "Administrator", time.time(), 1))
-                conn.commit()
-                log.info("Admin account created: %s", ADMIN_EMAIL)
-    finally:
-        conn.close()
-
-
-def _hash_password(password: str, salt: str) -> str:
-    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100000).hex()
-
-
-def _verify_password(password: str, salt: str, stored_hash: str) -> bool:
-    return hmac.compare_digest(_hash_password(password, salt), stored_hash)
-
-
-def db_get_user_by_email(email: str):
-    conn = _db()
-    try:
-        return conn.execute("SELECT * FROM users WHERE email=?", (email.lower(),)).fetchone()
-    finally:
-        conn.close()
-
-
-def db_get_user_by_id(uid: int):
-    conn = _db()
-    try:
-        return conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
-    finally:
-        conn.close()
-
-
-def db_create_user(email: str, password: str, display_name: str = ""):
-    salt = secrets.token_hex(16)
-    phash = _hash_password(password, salt)
-    conn = _db()
-    try:
-        cur = conn.execute(
-            "INSERT INTO users (email, password_hash, password_salt, display_name, "
-            "created_at, is_active, is_admin, has_bot_access) VALUES (?,?,?,?,?,?,0,1)",
-            (email.lower(), phash, salt, display_name, time.time()))
-        conn.commit()
-        return cur.lastrowid
-    except sqlite3.IntegrityError:
-        return None
-    finally:
-        conn.close()
-
-
-def db_update_user(uid: int, **fields):
-    allowed = {"display_name", "is_active", "is_admin", "has_bot_access",
-               "is_banned", "banned_reason", "last_login", "telegram_id"}
-    sets = []
-    vals = []
-    for k, v in fields.items():
-        if k in allowed:
-            sets.append(f"{k}=?")
-            vals.append(v)
-    if not sets:
-        return
-    vals.append(uid)
-    conn = _db()
-    try:
-        conn.execute(f"UPDATE users SET {','.join(sets)} WHERE id=?", vals)
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def db_list_users():
-    conn = _db()
-    try:
-        return conn.execute(
-            "SELECT * FROM users ORDER BY created_at DESC").fetchall()
-    finally:
-        conn.close()
-
-
-def db_create_session(user_id: int, ip: str, ua: str) -> str:
-    token = secrets.token_urlsafe(32)
-    now = time.time()
-    conn = _db()
-    try:
-        conn.execute(
-            "INSERT INTO sessions (token, user_id, created_at, expires_at, ip_address, user_agent) "
-            "VALUES (?,?,?,?,?,?)",
-            (token, user_id, now, now + SESSION_DURATION, ip, ua[:200]))
-        conn.execute("UPDATE users SET last_login=? WHERE id=?", (now, user_id))
-        conn.commit()
-        return token
-    finally:
-        conn.close()
-
-
-def db_get_session(token: str):
-    if not token:
-        return None
-    conn = _db()
-    try:
-        row = conn.execute(
-            "SELECT * FROM sessions WHERE token=? AND expires_at>?",
-            (token, time.time())).fetchone()
-        if row:
-            conn.execute("UPDATE sessions SET expires_at=? WHERE token=?",
-                         (time.time() + SESSION_DURATION, token))
-            conn.commit()
-        return row
-    finally:
-        conn.close()
-
-
-def db_delete_session(token: str):
-    conn = _db()
-    try:
-        conn.execute("DELETE FROM sessions WHERE token=?", (token,))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def db_log_activity(user_id: int, action: str, details: str = "", ip: str = ""):
-    conn = _db()
-    try:
-        conn.execute(
-            "INSERT INTO activity_logs (user_id, action, details, ip_address, timestamp) "
-            "VALUES (?,?,?,?,?)",
-            (user_id, action, details, ip, time.time()))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def db_log_usage(user_id: int, action: str, file_count: int = 0):
-    conn = _db()
-    try:
-        conn.execute(
-            "INSERT INTO usage_stats (user_id, action, file_count, timestamp) VALUES (?,?,?,?)",
-            (user_id, action, file_count, time.time()))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def db_get_setting(key: str, default: str = ""):
-    conn = _db()
-    try:
-        row = conn.execute("SELECT value FROM system_settings WHERE key=?", (key,)).fetchone()
-        return row["value"] if row else default
-    finally:
-        conn.close()
-
-
-def db_set_setting(key: str, value: str):
-    conn = _db()
-    try:
-        conn.execute(
-            "INSERT INTO system_settings (key, value, updated_at) VALUES (?,?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-            (key, value, time.time()))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def db_get_all_settings():
-    conn = _db()
-    try:
-        rows = conn.execute("SELECT key, value FROM system_settings").fetchall()
-        return {r["key"]: r["value"] for r in rows}
-    finally:
-        conn.close()
-
-
-def db_recent_activity(limit=100):
-    conn = _db()
-    try:
-        return conn.execute(
-            "SELECT a.*, u.email FROM activity_logs a LEFT JOIN users u ON a.user_id=u.id "
-            "ORDER BY a.timestamp DESC LIMIT ?", (limit,)).fetchall()
-    finally:
-        conn.close()
-
-
-def db_usage_summary():
-    conn = _db()
-    try:
-        total = conn.execute("SELECT COUNT(*) as c FROM usage_stats").fetchone()["c"]
-        by_action = conn.execute(
-            "SELECT action, COUNT(*) as c, SUM(file_count) as fc FROM usage_stats GROUP BY action"
-        ).fetchall()
-        return {"total": total, "by_action": [dict(r) for r in by_action]}
-    finally:
-        conn.close()
-
-
-def db_user_count():
-    conn = _db()
-    try:
-        return conn.execute("SELECT COUNT(*) as c FROM users").fetchone()["c"]
-    finally:
-        conn.close()
-
-
-def db_active_session_count():
-    conn = _db()
-    try:
-        return conn.execute(
-            "SELECT COUNT(*) as c FROM sessions WHERE expires_at>?",
-            (time.time(),)).fetchone()["c"]
-    finally:
-        conn.close()
-
-
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
 
 def verify_init_data(init_data: str):
+    """Validate Telegram WebApp initData (HMAC). Returns user id or None."""
     try:
         if not init_data or not BOT_TOKEN:
             return None
@@ -516,6 +187,9 @@ def verify_init_data(init_data: str):
     except Exception:
         return None
 
+# --------------------------------------------------------------------------- #
+# Small helpers
+# --------------------------------------------------------------------------- #
 
 def mm_to_px(mm: float, dpi: int = DPI) -> int:
     return max(1, int(round(mm / 25.4 * dpi)))
@@ -526,7 +200,7 @@ def unit_to_mm(value: float, unit: str) -> float:
         return value * 10.0
     if unit == "inch":
         return value * 25.4
-    return value
+    return value  # mm
 
 
 def parse_float(text: str):
@@ -540,6 +214,7 @@ def parse_float(text: str):
 
 
 def parse_hex_color(text: str):
+    """Return (r, g, b) for '#RRGGBB' / 'RRGGBB', else None."""
     if not text:
         return None
     t = text.strip()
@@ -553,22 +228,22 @@ def rgb_to_hex(rgb) -> str:
     return "#{:02X}{:02X}{:02X}".format(*rgb)
 
 
-def user_dir(user_id) -> Path:
-    key = str(user_id)
-    d = TMP_ROOT / key
+def user_dir(user_id: int) -> Path:
+    d = TMP_ROOT / str(user_id)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def cleanup_dir(path: Path) -> None:
+def cleanup_user(user_id: int) -> None:
     try:
-        if path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(TMP_ROOT / str(user_id), ignore_errors=True)
     except Exception:
-        pass
+        log.warning("cleanup failed for user %s", user_id)
 
 
 def compute_grid(page_w_mm, page_h_mm, pw_mm, ph_mm):
+    """Dynamic layout: how many columns/rows of pw x ph photos fit inside the
+    printable area. Returns (cols, rows) or None if even one photo can't fit."""
     printable_w = page_w_mm - 2 * MARGIN_MM
     printable_h = page_h_mm - 2 * MARGIN_MM
     if pw_mm > printable_w or ph_mm > printable_h:
@@ -579,9 +254,8 @@ def compute_grid(page_w_mm, page_h_mm, pw_mm, ph_mm):
         return None
     return cols, rows
 
-
 # --------------------------------------------------------------------------- #
-# Image processing
+# Image processing (shared by Telegram bot AND Mini App API)
 # --------------------------------------------------------------------------- #
 
 def load_image(data: bytes) -> Image.Image:
@@ -592,311 +266,17 @@ def load_image(data: bytes) -> Image.Image:
     img.load()
     if max(img.size) > MAX_IMAGE_SIDE:
         raise ValueError("Image dimensions are too large.")
-    if img.mode not in ("RGB", "RGBA"):
+    if img.mode in ("RGBA", "LA", "P", "CMYK", "I;16", "I", "F", "L"):
+        img = img.convert("RGB")
+    elif img.mode != "RGB":
         img = img.convert("RGB")
     return img
 
 
-def _ensure_rgb(img: Image.Image) -> Image.Image:
-    if img.mode == "RGBA":
-        bg = Image.new("RGB", img.size, (255, 255, 255))
-        bg.paste(img, mask=img.getchannel("A"))
-        return bg
-    return img.convert("RGB") if img.mode != "RGB" else img
-
-
-# --- Adjustments (factor 1.0 = no change) ---
-
-def adj_brightness(img: Image.Image, factor: float) -> Image.Image:
-    factor = max(0.0, min(3.0, factor))
-    if abs(factor - 1.0) < 0.001:
-        return img
-    return ImageEnhance.Brightness(img).enhance(factor)
-
-
-def adj_contrast(img: Image.Image, factor: float) -> Image.Image:
-    factor = max(0.0, min(3.0, factor))
-    if abs(factor - 1.0) < 0.001:
-        return img
-    return ImageEnhance.Contrast(img).enhance(factor)
-
-
-def adj_saturation(img: Image.Image, factor: float) -> Image.Image:
-    factor = max(0.0, min(3.0, factor))
-    if abs(factor - 1.0) < 0.001:
-        return img
-    return ImageEnhance.Color(img).enhance(factor)
-
-
-def adj_sharpness(img: Image.Image, factor: float) -> Image.Image:
-    factor = max(0.0, min(5.0, factor))
-    if abs(factor - 1.0) < 0.001:
-        return img
-    return ImageEnhance.Sharpness(img).enhance(factor)
-
-
-def adj_exposure(img: Image.Image, stops: float) -> Image.Image:
-    """Adjust exposure in stops (-3 to +3). Uses gamma correction for natural results."""
-    stops = max(-3.0, min(3.0, stops))
-    if abs(stops) < 0.01:
-        return img
-    gamma = 1.0 / (2.0 ** stops)
-    gamma = max(0.1, min(10.0, gamma))
-    arr = np.asarray(img).astype(np.float32) / 255.0
-    arr = np.clip(arr ** gamma, 0.0, 1.0)
-    return Image.fromarray((arr * 255).astype(np.uint8), img.mode)
-
-
-def adj_temperature(img: Image.Image, warmth: float) -> Image.Image:
-    """Warmth: -100 (cool) to +100 (warm). 0 = neutral."""
-    warmth = max(-100.0, min(100.0, warmth)) / 100.0
-    if abs(warmth) < 0.01:
-        return img
-    arr = np.asarray(img).astype(np.float32)
-    r_shift = warmth * 30
-    b_shift = -warmth * 30
-    arr[..., 0] = np.clip(arr[..., 0] + r_shift, 0, 255)
-    arr[..., 2] = np.clip(arr[..., 2] + b_shift, 0, 255)
-    return Image.fromarray(arr.astype(np.uint8), img.mode)
-
-
-def adj_tint(img: Image.Image, tint: float) -> Image.Image:
-    """Tint: -100 (green) to +100 (magenta). 0 = neutral."""
-    tint = max(-100.0, min(100.0, tint)) / 100.0
-    if abs(tint) < 0.01:
-        return img
-    arr = np.asarray(img).astype(np.float32)
-    g_shift = -tint * 25
-    arr[..., 1] = np.clip(arr[..., 1] + g_shift, 0, 255)
-    return Image.fromarray(arr.astype(np.uint8), img.mode)
-
-
-def adj_color_balance(img: Image.Image, r: float, g: float, b: float) -> Image.Image:
-    """Per-channel balance: -100 to +100 for each channel."""
-    arr = np.asarray(img).astype(np.float32)
-    shifts = [max(-100, min(100, r)), max(-100, min(100, g)), max(-100, min(100, b))]
-    for i in range(3):
-        arr[..., i] = np.clip(arr[..., i] + shifts[i], 0, 255)
-    return Image.fromarray(arr.astype(np.uint8), img.mode)
-
-
-def adj_skin_tone(img: Image.Image, warmth: float, smoothness: float) -> Image.Image:
-    """Enhance skin tones naturally. warmth: -50..50, smoothness: 0..100."""
-    warmth = max(-50.0, min(50.0, warmth)) / 50.0
-    smoothness = max(0.0, min(100.0, smoothness)) / 100.0
-    arr = np.asarray(img).astype(np.float32)
-
-    # Detect skin-tone pixels (warm, moderate saturation, not too dark/light)
-    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
-    skin_mask = (
-        (r > 95) & (g > 40) & (b > 20) &
-        (r > g) & (r > b) &
-        (r - g > 12) &
-        (np.maximum(r, np.maximum(g, b)) - np.minimum(r, np.minimum(g, b)) > 12)
-    ).astype(np.float32)
-
-    if warmth != 0:
-        warmth_arr = np.zeros_like(arr)
-        warmth_arr[..., 0] = warmth * 18
-        warmth_arr[..., 2] = -warmth * 12
-        arr += warmth_arr * skin_mask[..., None]
-        arr = np.clip(arr, 0, 255)
-
-    if smoothness > 0:
-        smoothed = Image.fromarray(arr.astype(np.uint8), img.mode).filter(
-            ImageFilter.SMOOTH_MORE)
-        # Bilateral-like: blend smoothed with original only on skin
-        sm_arr = np.asarray(smoothed).astype(np.float32)
-        blend = skin_mask * smoothness * 0.6
-        arr = arr * (1 - blend[..., None]) + sm_arr * blend[..., None]
-
-    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), img.mode)
-
-
-def adj_vignette(img: Image.Image, strength: float) -> Image.Image:
-    """Vignette: 0 (none) to 100 (strong)."""
-    strength = max(0.0, min(100.0, strength)) / 100.0
-    if strength < 0.01:
-        return img
-    w, h = img.size
-    arr = np.asarray(img).astype(np.float32)
-    Y, X = np.ogrid[:h, :w]
-    cx, cy = w / 2, h / 2
-    dist = np.sqrt(((X - cx) / cx) ** 2 + ((Y - cy) / cy) ** 2)
-    mask = np.clip(1.0 - dist * strength * 0.9, 0.0, 1.0)
-    arr *= mask[..., None]
-    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), img.mode)
-
-
-def adj_gamma(img: Image.Image, gamma: float) -> Image.Image:
-    gamma = max(0.1, min(10.0, gamma))
-    arr = np.asarray(img).astype(np.float32) / 255.0
-    arr = np.clip(arr ** (1.0 / gamma), 0.0, 1.0)
-    return Image.fromarray((arr * 255).astype(np.uint8), img.mode)
-
-
-def auto_enhance(img: Image.Image) -> Image.Image:
-    """Auto-enhance: auto-contrast + mild saturation + mild sharpen + auto-levels."""
-    img = ImageOps.autocontrast(img, cutoff=1)
-    img = ImageEnhance.Color(img).enhance(1.08)
-    img = ImageEnhance.Sharpness(img).enhance(1.15)
-    img = ImageEnhance.Contrast(img).enhance(1.05)
-    return img
-
-
-def denoise_image(img: Image.Image, strength: float = 1.0) -> Image.Image:
-    """Reduce noise while preserving edges."""
-    strength = max(0.0, min(2.0, strength))
-    if strength < 0.01:
-        return img
-    if strength >= 1.5:
-        return img.filter(ImageFilter.MedianFilter(size=3))
-    return img.filter(ImageFilter.SMOOTH_MORE)
-
-
-# --- Filters ---
-
-FILTERS = {
-    "original": None,
-    "auto_enhance": "auto_enhance",
-    "vivid": "vivid",
-    "warm": "warm",
-    "cool": "cool",
-    "vintage": "vintage",
-    "sepia": "sepia",
-    "bw": "bw",
-    "noir": "noir",
-    "fade": "fade",
-    "dramatic": "dramatic",
-    "soft_glow": "soft_glow",
-    "matte": "matte",
-    "chrome": "chrome",
-}
-
-
-def apply_filter(img: Image.Image, name: str) -> Image.Image:
-    if name == "original" or name not in FILTERS or FILTERS[name] is None:
-        return img
-    arr = np.asarray(img).astype(np.float32)
-    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
-
-    if name == "vivid":
-        img = ImageEnhance.Color(img).enhance(1.35)
-        img = ImageEnhance.Contrast(img).enhance(1.12)
-        img = ImageEnhance.Sharpness(img).enhance(1.1)
-        return img
-    elif name == "warm":
-        arr2 = arr.copy()
-        arr2[..., 0] = np.clip(arr2[..., 0] + 15, 0, 255)
-        arr2[..., 2] = np.clip(arr2[..., 2] - 12, 0, 255)
-        img = Image.fromarray(arr2.astype(np.uint8), img.mode)
-        return ImageEnhance.Color(img).enhance(1.1)
-    elif name == "cool":
-        arr2 = arr.copy()
-        arr2[..., 0] = np.clip(arr2[..., 0] - 10, 0, 255)
-        arr2[..., 2] = np.clip(arr2[..., 2] + 15, 0, 255)
-        img = Image.fromarray(arr2.astype(np.uint8), img.mode)
-        return ImageEnhance.Color(img).enhance(1.08)
-    elif name == "vintage":
-        # sepia-ish + vignette + fade
-        tr = 0.393 * r + 0.769 * g + 0.189 * b
-        tg = 0.349 * r + 0.686 * g + 0.168 * b
-        tb = 0.272 * r + 0.534 * g + 0.131 * b
-        arr2 = np.stack([tr, tg, tb], axis=-1)
-        arr2 = np.clip(arr2 * 0.85 + 30, 0, 255)  # fade/lift
-        img = Image.fromarray(arr2.astype(np.uint8), img.mode)
-        return adj_vignette(img, 35)
-    elif name == "sepia":
-        tr = 0.393 * r + 0.769 * g + 0.189 * b
-        tg = 0.349 * r + 0.686 * g + 0.168 * b
-        tb = 0.272 * r + 0.534 * g + 0.131 * b
-        arr2 = np.stack([tr, tg, tb], axis=-1)
-        return Image.fromarray(np.clip(arr2, 0, 255).astype(np.uint8), img.mode)
-    elif name == "bw":
-        gray = 0.299 * r + 0.587 * g + 0.114 * b
-        arr2 = np.stack([gray, gray, gray], axis=-1)
-        img = Image.fromarray(arr2.astype(np.uint8), img.mode)
-        return ImageEnhance.Contrast(img).enhance(1.1)
-    elif name == "noir":
-        gray = 0.299 * r + 0.587 * g + 0.114 * b
-        arr2 = np.stack([gray, gray, gray], axis=-1)
-        img = Image.fromarray(arr2.astype(np.uint8), img.mode)
-        img = ImageEnhance.Contrast(img).enhance(1.4)
-        return adj_vignette(img, 50)
-    elif name == "fade":
-        arr2 = arr * 0.82 + 40
-        img = Image.fromarray(np.clip(arr2, 0, 255).astype(np.uint8), img.mode)
-        return ImageEnhance.Contrast(img).enhance(0.9)
-    elif name == "dramatic":
-        img = ImageEnhance.Contrast(img).enhance(1.3)
-        img = ImageEnhance.Color(img).enhance(1.15)
-        img = ImageEnhance.Sharpness(img).enhance(1.2)
-        return adj_vignette(img, 40)
-    elif name == "soft_glow":
-        bright = ImageEnhance.Brightness(img).enhance(1.05)
-        blur = bright.filter(ImageFilter.GaussianBlur(3))
-        blur = ImageEnhance.Brightness(blur).enhance(1.3)
-        return ImageChops.screen(img, blur)
-    elif name == "matte":
-        arr2 = arr * 0.88 + 25
-        img = Image.fromarray(np.clip(arr2, 0, 255).astype(np.uint8), img.mode)
-        return ImageEnhance.Contrast(img).enhance(0.92)
-    elif name == "chrome":
-        img = ImageEnhance.Color(img).enhance(0.7)
-        img = ImageEnhance.Contrast(img).enhance(1.2)
-        return adj_temperature(img, 10)
-    return img
-
-
-# --- Crop / Resize / Rotate / Flip ---
-
-def crop_image(img: Image.Image, x: int, y: int, w: int, h: int) -> Image.Image:
-    x = max(0, x)
-    y = max(0, y)
-    w = max(1, min(w, img.width - x))
-    h = max(1, min(h, img.height - y))
-    return img.crop((x, y, x + w, y + h))
-
-
-def crop_to_ratio(img: Image.Image, ratio: float) -> Image.Image:
-    w, h = img.size
-    cur = w / h
-    if abs(cur - ratio) < 1e-3:
-        return img
-    if cur > ratio:
-        new_w = int(round(h * ratio))
-        x0 = (w - new_w) // 2
-        return img.crop((x0, 0, x0 + new_w, h))
-    new_h = int(round(w / ratio))
-    y0 = int(round((h - new_h) * 0.30))
-    y0 = max(0, min(h - new_h, y0))
-    return img.crop((0, y0, w, y0 + new_h))
-
-
-def resize_image(img: Image.Image, width: int, height: int) -> Image.Image:
-    width = max(1, min(width, MAX_IMAGE_SIDE))
-    height = max(1, min(height, MAX_IMAGE_SIDE))
-    return img.resize((width, height), Image.LANCZOS)
-
-
-def rotate_image(img: Image.Image, degrees: float) -> Image.Image:
-    if degrees == 0:
-        return img
-    rotated = img.rotate(-degrees, expand=True, fillcolor=(255, 255, 255))
-    return rotated
-
-
-def flip_image(img: Image.Image, direction: str) -> Image.Image:
-    if direction == "horizontal":
-        return ImageOps.mirror(img)
-    elif direction == "vertical":
-        return ImageOps.flip(img)
-    return img
-
-
-# --- Background ---
-
 def _bg_mask_from_border(small: Image.Image):
+    """Return (dist, bg_mask) for a small RGB image.
+    bg_mask = pixels similar to the border colour AND connected to the border
+    (so a similar colour inside the person is NOT removed)."""
     arr = np.asarray(small).astype(np.float32)
     h, w, _ = arr.shape
     b = max(3, min(h, w) // 50)
@@ -904,17 +284,19 @@ def _bg_mask_from_border(small: Image.Image):
         arr[:b, :, :].reshape(-1, 3),
         arr[:, :b, :].reshape(-1, 3),
         arr[:, -b:, :].reshape(-1, 3),
-    ])
+    ])  # top + left + right edges (bottom usually holds the shoulders)
     ref = np.median(border, axis=0)
     spread = np.sqrt(((border - ref) ** 2).sum(axis=1))
     tol = float(np.clip(np.percentile(spread, 90) * 1.6 + 18, 30, 80))
     dist = np.sqrt(((arr - ref) ** 2).sum(axis=2))
     cand = dist < tol
+
     seed = np.zeros_like(cand)
     seed[:b, :] = True
     seed[:, :b] = True
     seed[:, -b:] = True
     seed &= cand
+
     try:
         from scipy import ndimage
         lab, _n = ndimage.label(cand)
@@ -922,6 +304,7 @@ def _bg_mask_from_border(small: Image.Image):
         keep = keep[keep != 0]
         bg = np.isin(lab, keep)
     except Exception:
+        # scipy-free flood fill by repeated dilation inside the candidate mask
         cur = Image.fromarray((seed * 255).astype(np.uint8), "L")
         cmask = Image.fromarray((cand * 255).astype(np.uint8), "L")
         prev = -1
@@ -936,16 +319,24 @@ def _bg_mask_from_border(small: Image.Image):
 
 
 def _builtin_bg_replace(img: Image.Image, rgb):
+    """Memory-safe background replacement (no AI model). Returns (img, ok)."""
     k = min(1.0, 1100 / max(img.size))
     small = img if k >= 1 else img.resize(
         (max(1, int(img.width * k)), max(1, int(img.height * k))), Image.BILINEAR)
     dist, tol, bg = _bg_mask_from_border(small)
     frac = float(bg.mean())
     if frac < 0.06 or frac > 0.85:
-        return img, False
+        return img, False  # background not plain enough -> do not damage photo
+    # Safety: the lower part of a passport photo is the person's clothes.
+    # If most of it was classified as "background" (e.g. white shirt on white
+    # wall), the cut-out is unreliable -> keep the original instead of
+    # painting the clothes with the new colour.
     if float(bg[int(bg.shape[0] * 0.8):, :].mean()) > 0.45:
         return img, False
+
     bgimg = Image.fromarray((bg * 255).astype(np.uint8), "L")
+    # soft edge band: pixels just outside the bg region that still look
+    # partly like the old background get partial transparency (kills halos)
     band = bgimg.filter(ImageFilter.MaxFilter(7))
     band_np = (np.asarray(band) > 127) & (~bg)
     fg = np.ones_like(dist, dtype=np.float32)
@@ -965,7 +356,7 @@ def _rembg_replace(img: Image.Image, rgb):
     if max(img.size) > RMBG_MAX_SIDE:
         k = RMBG_MAX_SIDE / max(img.size)
         small = img.resize((max(1, int(img.width * k)),
-                           max(1, int(img.height * k))), Image.LANCZOS)
+                            max(1, int(img.height * k))), Image.LANCZOS)
     kw = {"session": _rembg_session} if _rembg_session else {}
     out = _rembg_remove(small, **kw)
     if isinstance(out, bytes):
@@ -978,6 +369,8 @@ def _rembg_replace(img: Image.Image, rgb):
 
 
 def replace_background(img: Image.Image, rgb):
+    """Replace the photo background with rgb. Never raises.
+    Returns (image, note) where note is a warning string or None."""
     if USE_REMBG and _load_rembg():
         try:
             return _rembg_replace(img, rgb), None
@@ -987,142 +380,33 @@ def replace_background(img: Image.Image, rgb):
         out, ok = _builtin_bg_replace(img, rgb)
         if ok:
             return out, None
-        return img, ("⚠️ Background could not be detected automatically. "
-                     "Original background kept.")
+        return img, ("⚠️ Background could not be detected automatically "
+                     "(it is not a plain colour). Original background kept.")
     except Exception:
         log.warning("built-in background replace failed", exc_info=True)
         return img, "⚠️ Background change failed. Original background kept."
 
 
-def remove_background(img: Image.Image) -> Image.Image:
-    """Return RGBA image with transparent background."""
-    if USE_REMBG and _load_rembg():
-        try:
-            small = img
-            if max(img.size) > RMBG_MAX_SIDE:
-                k = RMBG_MAX_SIDE / max(img.size)
-                small = img.resize((max(1, int(img.width * k)),
-                                   max(1, int(img.height * k))), Image.LANCZOS)
-            kw = {"session": _rembg_session} if _rembg_session else {}
-            out = _rembg_remove(small, **kw)
-            if isinstance(out, bytes):
-                out = Image.open(io.BytesIO(out))
-            rgba = out.convert("RGBA")
-            if rgba.size != img.size:
-                rgba = rgba.resize(img.size, Image.LANCZOS)
-            return rgba
-        except Exception:
-            pass
-    # Fallback: detect bg, make transparent
-    k = min(1.0, 1100 / max(img.size))
-    small = img if k >= 1 else img.resize(
-        (max(1, int(img.width * k)), max(1, int(img.height * k))), Image.BILINEAR)
-    dist, tol, bg = _bg_mask_from_border(small)
-    fg = np.ones_like(dist, dtype=np.float32)
-    fg[bg] = 0.0
-    soft = np.clip((dist - tol) / (tol * 1.2), 0.0, 1.0)
-    alpha = Image.fromarray((fg * 255).astype(np.uint8), "L")
-    if alpha.size != img.size:
-        alpha = alpha.resize(img.size, Image.BICUBIC)
-    alpha = alpha.filter(ImageFilter.GaussianBlur(1.0))
-    rgba = img.convert("RGBA")
-    rgba.putalpha(alpha)
-    return rgba
-
-
-# --- Export ---
-
-def export_image(img: Image.Image, fmt: str, quality: int = 95) -> bytes:
-    buf = io.BytesIO()
-    fmt = fmt.lower()
-    if fmt in ("jpg", "jpeg"):
-        out = _ensure_rgb(img)
-        out.save(buf, "JPEG", quality=max(1, min(100, quality)),
-                 subsampling=0, optimize=True)
-    elif fmt == "png":
-        out = img if img.mode in ("RGBA", "RGB") else img.convert("RGB")
-        out.save(buf, "PNG", optimize=True)
-    elif fmt == "webp":
-        out = _ensure_rgb(img)
-        out.save(buf, "WEBP", quality=max(1, min(100, quality)))
-    elif fmt == "bmp":
-        _ensure_rgb(img).save(buf, "BMP")
-    elif fmt == "tiff":
-        _ensure_rgb(img).save(buf, "TIFF")
-    else:
-        _ensure_rgb(img).save(buf, "JPEG", quality=95)
-    return buf.getvalue()
-
-
-def compress_image(img: Image.Image, quality: int) -> bytes:
-    return export_image(img, "jpg", quality)
-
-
-# --- Apply a chain of operations ---
-
-def apply_operations(img: Image.Image, ops: list) -> Image.Image:
-    """Apply an ordered list of operation dicts to an image."""
-    for op in ops:
-        t = op.get("op")
-        if t == "brightness":
-            img = adj_brightness(img, op.get("factor", 1.0))
-        elif t == "contrast":
-            img = adj_contrast(img, op.get("factor", 1.0))
-        elif t == "saturation":
-            img = adj_saturation(img, op.get("factor", 1.0))
-        elif t == "sharpness":
-            img = adj_sharpness(img, op.get("factor", 1.0))
-        elif t == "exposure":
-            img = adj_exposure(img, op.get("stops", 0.0))
-        elif t == "temperature":
-            img = adj_temperature(img, op.get("value", 0.0))
-        elif t == "tint":
-            img = adj_tint(img, op.get("value", 0.0))
-        elif t == "color_balance":
-            img = adj_color_balance(img, op.get("r", 0), op.get("g", 0), op.get("b", 0))
-        elif t == "skin_tone":
-            img = adj_skin_tone(img, op.get("warmth", 0), op.get("smoothness", 0))
-        elif t == "vignette":
-            img = adj_vignette(img, op.get("value", 0))
-        elif t == "gamma":
-            img = adj_gamma(img, op.get("value", 1.0))
-        elif t == "filter":
-            img = apply_filter(img, op.get("name", "original"))
-        elif t == "auto_enhance":
-            img = auto_enhance(img)
-        elif t == "denoise":
-            img = denoise_image(img, op.get("strength", 1.0))
-        elif t == "crop":
-            img = crop_image(img, op.get("x", 0), op.get("y", 0),
-                            op.get("w", img.width), op.get("h", img.height))
-        elif t == "crop_ratio":
-            img = crop_to_ratio(img, op.get("ratio", 1.0))
-        elif t == "resize":
-            img = resize_image(img, op.get("w", img.width), op.get("h", img.height))
-        elif t == "rotate":
-            img = rotate_image(img, op.get("degrees", 0))
-        elif t == "flip":
-            img = flip_image(img, op.get("direction", "horizontal"))
-        elif t == "background":
-            rgb = parse_hex_color(op.get("hex", "#FFFFFF"))
-            img, _ = replace_background(img, rgb)
-        elif t == "remove_bg":
-            img = remove_background(img)
-    return img
-
-
-def make_preview(img: Image.Image) -> Image.Image:
-    """Downscale for fast preview."""
+def crop_to_ratio(img: Image.Image, ratio: float) -> Image.Image:
+    """Aspect-ratio-preserving intelligent crop (never stretches).
+    Keeps the upper part of the frame so the head/face is not cut off."""
     w, h = img.size
-    if max(w, h) > PREVIEW_MAX_SIDE:
-        k = PREVIEW_MAX_SIDE / max(w, h)
-        return img.resize((max(1, int(w * k)), max(1, int(h * k))), Image.LANCZOS)
-    return img
+    cur = w / h
+    if abs(cur - ratio) < 1e-3:
+        return img
+    if cur > ratio:  # too wide -> crop sides, centered
+        new_w = int(round(h * ratio))
+        x0 = (w - new_w) // 2
+        return img.crop((x0, 0, x0 + new_w, h))
+    # too tall -> crop from bottom with an upper bias to protect the head
+    new_h = int(round(w / ratio))
+    y0 = int(round((h - new_h) * 0.30))
+    y0 = max(0, min(h - new_h, y0))
+    return img.crop((0, y0, w, y0 + new_h))
 
-
-# --- Passport photo generation (preserved from original) ---
 
 def build_passport_photo(img: Image.Image, bg_rgb, pw_mm, ph_mm):
+    """Returns (photo, note)."""
     note = None
     if bg_rgb is not None:
         img, note = replace_background(img, bg_rgb)
@@ -1135,18 +419,24 @@ def build_passport_photo(img: Image.Image, bg_rgb, pw_mm, ph_mm):
 
 def build_sheet(photo: Image.Image, page_w_mm, page_h_mm,
                 pw_mm, ph_mm, count) -> Image.Image:
+    """Render one print sheet: clean white page, dynamically computed grid,
+    centered, evenly spaced, thin consistent borders. Never overflows."""
     grid = compute_grid(page_w_mm, page_h_mm, pw_mm, ph_mm)
     if grid is None:
         raise ValueError("Selected photo size does not fit on the selected page.")
     cols, _rows = grid
     count = max(1, min(count, cols * _rows))
+
     W, H = mm_to_px(page_w_mm), mm_to_px(page_h_mm)
     pw, ph = photo.size
     sp = mm_to_px(SPACING_MM)
     margin = mm_to_px(MARGIN_MM)
     border = max(2, mm_to_px(BORDER_MM))
+
+    # Page is exactly the selected size; photos start at the TOP-LEFT.
     sheet = Image.new("RGB", (W, H), (255, 255, 255))
     draw = ImageDraw.Draw(sheet)
+
     for i in range(count):
         row, col = divmod(i, cols)
         x = margin + col * (pw + sp)
@@ -1158,7 +448,11 @@ def build_sheet(photo: Image.Image, page_w_mm, page_h_mm,
 
 
 def generate_files(image_bytes: bytes, page_w_mm: float, page_h_mm: float,
-                   bg_rgb, pw_mm: float, ph_mm: float, qty: int, fmt: str):
+                   bg_rgb, pw_mm: float, ph_mm: float,
+                   qty: int, fmt: str):
+    """Full pipeline shared by bot & Mini App.
+    Returns (list_of_(filename, bytes), num_pages). Raises ValueError on
+    invalid input that can't be produced."""
     img = load_image(image_bytes)
     grid = compute_grid(page_w_mm, page_h_mm, pw_mm, ph_mm)
     if grid is None:
@@ -1168,13 +462,17 @@ def generate_files(image_bytes: bytes, page_w_mm: float, page_h_mm: float,
     cols, rows = grid
     capacity = cols * rows
     pages = math.ceil(qty / capacity)
+
     passport, note = build_passport_photo(img, bg_rgb, pw_mm, ph_mm)
+
     sheets = []
     remaining = qty
     for _ in range(pages):
         take = min(capacity, remaining)
-        sheets.append(build_sheet(passport, page_w_mm, page_h_mm, pw_mm, ph_mm, take))
+        sheets.append(build_sheet(passport, page_w_mm, page_h_mm,
+                                  pw_mm, ph_mm, take))
         remaining -= take
+
     stamp = time.strftime("%Y%m%d-%H%M%S")
     uid = uuid.uuid4().hex[:6]
     base = f"passport_photos_{stamp}_{uid}"
@@ -1208,9 +506,8 @@ def generate_files(image_bytes: bytes, page_w_mm: float, page_h_mm: float,
             to_png(s, f"{base}_p{i}.png")
     return files, pages, note
 
-
 # --------------------------------------------------------------------------- #
-# Telegram Bot (preserved passport-photo flow)
+# FSM states
 # --------------------------------------------------------------------------- #
 
 class Flow(StatesGroup):
@@ -1223,6 +520,9 @@ class Flow(StatesGroup):
     ps_custom_u = State()
     qty_custom = State()
 
+# --------------------------------------------------------------------------- #
+# Keyboards
+# --------------------------------------------------------------------------- #
 
 def _rows(*btns_per_row):
     return [[InlineKeyboardButton(text=t, callback_data=c) for t, c in row]
@@ -1311,6 +611,9 @@ def kb_main_menu():
             web_app=WebAppInfo(url=WEBAPP_URL))])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+# --------------------------------------------------------------------------- #
+# Bot handlers
+# --------------------------------------------------------------------------- #
 
 router = Router()
 
@@ -1356,6 +659,7 @@ async def get_data_photo_path(state: FSMContext):
     if not p:
         return None, data
     path = Path(p)
+    # Path-traversal guard: only files inside our tmp root are acceptable.
     try:
         path.resolve().relative_to(TMP_ROOT.resolve())
     except ValueError:
@@ -1372,9 +676,12 @@ async def summary_text(state: FSMContext) -> str:
     psw, psh = data.get("ps_w", 0), data.get("ps_h", 0)
     qty = data.get("qty", 0)
     fmt = data.get("fmt", "pdf")
+    bg = data.get("bg")
     bg_name = data.get("bg_name", "Skip (original)")
+
     fmt_names = {"pdf": "PDF", "jpg": "JPEG", "png": "PNG",
                  "pdf_jpg": "PDF + JPEG", "pdf_png": "PDF + PNG"}
+
     lines = [
         "✅ <b>PHOTO READY</b>\n",
         f"📄 Page: {page_name} ({pw:g} × {ph:g} mm)",
@@ -1384,6 +691,7 @@ async def summary_text(state: FSMContext) -> str:
         f"📦 Format: {fmt_names.get(fmt, fmt)}",
         f"🖨 Quality: {DPI} DPI",
     ]
+
     grid = compute_grid(pw, ph, psw, psh)
     if grid is None:
         lines.append("\n⚠️ <b>This photo size does not fit on the selected "
@@ -1410,7 +718,10 @@ async def show_summary(cq_or_msg, state: FSMContext):
         await cq_or_msg.answer(text, reply_markup=kb)
 
 
-async def after_setting_selected(cq_or_msg, state: FSMContext, next_step: str):
+async def after_setting_selected(cq_or_msg, state: FSMContext,
+                                 next_step: str):
+    """If the user came from ✏️ Change Settings, jump straight back to the
+    summary; otherwise continue the normal forward flow."""
     data = await state.get_data()
     editing = data.get("editing", False)
     if editing:
@@ -1426,6 +737,8 @@ async def after_setting_selected(cq_or_msg, state: FSMContext, next_step: str):
         await cq_or_msg.answer(text, reply_markup=kb)
 
 
+# ----- /start, /help, /cancel -------------------------------------------- #
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -1440,7 +753,7 @@ async def cmd_help(message: Message):
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
-    cleanup_dir(user_dir(message.from_user.id))
+    cleanup_user(message.from_user.id)
     await message.answer("❌ Cancelled. Temporary files removed.",
                          reply_markup=kb_main_menu())
 
@@ -1457,13 +770,16 @@ async def cb_menu_create(cq: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "flow:cancel")
 async def cb_flow_cancel(cq: CallbackQuery, state: FSMContext):
     await state.clear()
-    cleanup_dir(user_dir(cq.from_user.id))
+    cleanup_user(cq.from_user.id)
     await safe_edit(cq, "❌ Cancelled. Temporary files removed.")
     await cq.message.answer(WELCOME, reply_markup=kb_main_menu())
     await cq.answer()
 
 
-async def _intake(message: Message, state: FSMContext, file_id: str, fname: str):
+# ----- photo intake ------------------------------------------------------- #
+
+async def _intake(message: Message, state: FSMContext, file_id: str,
+                  fname: str):
     status = await message.answer("⏳ Downloading your photo…")
     try:
         tg_file = await message.bot.get_file(file_id)
@@ -1474,13 +790,14 @@ async def _intake(message: Message, state: FSMContext, file_id: str, fname: str)
         buf = await message.bot.download_file(tg_file.file_path)
         data = buf.read()
         try:
-            img = load_image(data)
+            img = load_image(data)  # validate early, keep original bytes
             img.close()
         except Exception:
             await status.edit_text(
                 "⚠️ This doesn't look like a valid image. Please send a "
                 "clear JPEG/PNG photo.")
             return
+
         d = user_dir(message.from_user.id)
         path = d / f"orig_{uuid.uuid4().hex[:8]}.bin"
         path.write_bytes(data)
@@ -1500,7 +817,7 @@ async def _intake(message: Message, state: FSMContext, file_id: str, fname: str)
 
 @router.message(F.photo)
 async def on_photo(message: Message, state: FSMContext):
-    biggest = message.photo[-1]
+    biggest = message.photo[-1]  # highest available quality
     await _intake(message, state, biggest.file_id, "photo.jpg")
 
 
@@ -1519,6 +836,8 @@ async def on_document(message: Message, state: FSMContext):
     await _intake(message, state, doc.file_id, name)
 
 
+# ----- navigation (Back buttons) ------------------------------------------ #
+
 @router.callback_query(F.data.startswith("nav:"))
 async def cb_nav(cq: CallbackQuery, state: FSMContext):
     target = cq.data.split(":", 1)[1]
@@ -1536,7 +855,7 @@ async def cb_nav(cq: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("chg:"))
 async def cb_change(cq: CallbackQuery, state: FSMContext):
     await state.update_data(editing=True)
-    await cb_nav(cq, state)
+    await cb_nav(cq, state)  # reuse the same prompts
 
 
 @router.callback_query(F.data == "sum:change")
@@ -1545,6 +864,8 @@ async def cb_sum_change(cq: CallbackQuery, state: FSMContext):
                     kb_change())
     await cq.answer()
 
+
+# ----- step 1: page size --------------------------------------------------- #
 
 async def _need_photo(cq: CallbackQuery, state: FSMContext) -> bool:
     path, _ = await get_data_photo_path(state)
@@ -1620,6 +941,8 @@ async def cb_page_unit(cq: CallbackQuery, state: FSMContext):
     await cq.answer()
 
 
+# ----- step 2: background -------------------------------------------------- #
+
 @router.callback_query(F.data.startswith("bg:"))
 async def cb_bg(cq: CallbackQuery, state: FSMContext):
     if await _need_photo(cq, state):
@@ -1650,6 +973,8 @@ async def msg_bg_hex(message: Message, state: FSMContext):
     await state.set_state(None)
     await after_setting_selected(message, state, "ps")
 
+
+# ----- step 3: passport photo size ------------------------------------------ #
 
 _PS_CB = {"25x35": "25 × 35 mm", "30x40": "30 × 40 mm",
           "35x45": "35 × 45 mm", "2x2": "2 × 2 inch"}
@@ -1717,6 +1042,7 @@ async def cb_ps_unit(cq: CallbackQuery, state: FSMContext):
     await after_setting_selected(cq, state, "qty")
     await cq.answer()
 
+# ----- step 4: quantity ----------------------------------------------------- #
 
 @router.callback_query(F.data.startswith("qt:"))
 async def cb_qty(cq: CallbackQuery, state: FSMContext):
@@ -1757,6 +1083,8 @@ async def msg_qty(message: Message, state: FSMContext):
     await after_setting_selected(message, state, "fmt")
 
 
+# ----- step 5: output format ------------------------------------------------ #
+
 @router.callback_query(F.data.startswith("fm:"))
 async def cb_fmt(cq: CallbackQuery, state: FSMContext):
     if await _need_photo(cq, state):
@@ -1770,6 +1098,8 @@ async def cb_fmt(cq: CallbackQuery, state: FSMContext):
     await cq.answer()
 
 
+# ----- generate --------------------------------------------------------------- #
+
 @router.callback_query(F.data == "sum:generate")
 async def cb_generate(cq: CallbackQuery, state: FSMContext):
     path, data = await get_data_photo_path(state)
@@ -1779,17 +1109,20 @@ async def cb_generate(cq: CallbackQuery, state: FSMContext):
                         kb_main_menu())
         await cq.answer()
         return
+
     required = ("page_w", "page_h", "ps_w", "ps_h", "qty", "fmt")
     if any(k not in data for k in required):
         await safe_edit(cq, "⚠️ Some settings are missing. Let's go through "
                             "them again.", kb_page())
         await cq.answer()
         return
+
     page_w, page_h = data["page_w"], data["page_h"]
     ps_w, ps_h = data["ps_w"], data["ps_h"]
     qty, fmt = data["qty"], data["fmt"]
     bg_hex = data.get("bg")
     bg_rgb = parse_hex_color(bg_hex) if bg_hex else None
+
     grid = compute_grid(page_w, page_h, ps_w, ps_h)
     if grid is None:
         await safe_edit(cq,
@@ -1798,9 +1131,11 @@ async def cb_generate(cq: CallbackQuery, state: FSMContext):
             "Please adjust one of these:", kb_fit_error())
         await cq.answer()
         return
+
     await safe_edit(cq, "⏳ <b>Processing your photo…</b>\nThis can take a "
                         "moment, especially with background removal.")
     await cq.answer()
+
     note = None
     try:
         image_bytes = path.read_bytes()
@@ -1819,7 +1154,7 @@ async def cb_generate(cq: CallbackQuery, state: FSMContext):
     except ValueError as exc:
         await cq.message.answer(f"⚠️ {exc}", reply_markup=kb_summary())
         return
-    except BaseException as exc:
+    except BaseException as exc:  # never leave the user without an answer
         if isinstance(exc, asyncio.CancelledError):
             raise
         log.exception("generation failed")
@@ -1827,6 +1162,7 @@ async def cb_generate(cq: CallbackQuery, state: FSMContext):
                                 "generating your files. Please try again.",
                                 reply_markup=kb_summary())
         return
+
     try:
         caption = (f"🖨 Done! {qty} photo(s), {pages} page(s), "
                    f"{ps_w:g} × {ps_h:g} mm @ {DPI} DPI.")
@@ -1845,8 +1181,10 @@ async def cb_generate(cq: CallbackQuery, state: FSMContext):
                                 "Try fewer pages or a different format.")
     finally:
         await state.clear()
-        cleanup_dir(user_dir(cq.from_user.id))
+        cleanup_user(cq.from_user.id)
 
+
+# ----- catch-all for stray input --------------------------------------------- #
 
 @router.message()
 async def fallback_message(message: Message):
@@ -1859,2293 +1197,654 @@ async def fallback_callback(cq: CallbackQuery):
     await cq.answer("That action is no longer available. Send a photo or use "
                     "/start to begin again.", show_alert=False)
 
-
 # --------------------------------------------------------------------------- #
-# Premium Web UI (embedded HTML/CSS/JS)
+# Telegram Mini App (all HTML/CSS/JS embedded right here)
 # --------------------------------------------------------------------------- #
-
-APP_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5">
-<meta name="theme-color" content="#e11d2a">
-<title>Photo Studio Pro — Premium Photo Editor</title>
-<style>
-/* ===== Design System ===== */
-:root{
-  --red:#e11d2a;--red-d:#b31520;--red-l:#ff3b4a;--red-50:#fff1f2;--red-100:#ffe1e3;
-  --bg:#0e0f13;--bg-2:#16181f;--card:#1c1f29;--card-2:#232734;--card-hi:#2a2f3d;
-  --line:#2d3242;--line-2:#3a4053;
-  --txt:#f4f6fb;--txt-2:#c7ccd9;--mut:#8a92a6;--mut-2:#6b7286;
-  --ok:#34d399;--ok-bg:rgba(52,211,153,.12);--warn:#fbbf24;--err:#f87171;
-  --blue:#5b8def;--shadow:0 8px 30px rgba(0,0,0,.4);
-  --radius:14px;--radius-sm:10px;--radius-lg:20px;
-  --red-grad:linear-gradient(135deg,#ff2d3d 0%,#e11d2a 50%,#b31520 100%);
-  --red-soft:linear-gradient(135deg,#fff1f2 0%,#ffe1e3 100%);
-}
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%}
-body{font-family:'Inter',system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--txt);-webkit-font-smoothing:antialiased;overflow-x:hidden}
-a{color:var(--red-l);text-decoration:none}
-button{font-family:inherit;cursor:pointer;border:none;outline:none}
-input,select,textarea{font-family:inherit;outline:none}
-::-webkit-scrollbar{width:10px;height:10px}
-::-webkit-scrollbar-track{background:var(--bg)}
-::-webkit-scrollbar-thumb{background:var(--line);border-radius:6px}
-::-webkit-scrollbar-thumb:hover{background:var(--line-2)}
-
-/* ===== Auth ===== */
-.auth-wrap{min-height:100vh;display:grid;grid-template-columns:1fr 1fr;background:var(--bg)}
-.auth-hero{position:relative;overflow:hidden;background:var(--red-grad);display:flex;align-items:center;justify-content:center;padding:48px}
-.auth-hero::before{content:"";position:absolute;inset:0;background:radial-gradient(circle at 30% 20%,rgba(255,255,255,.15),transparent 50%),radial-gradient(circle at 70% 80%,rgba(0,0,0,.2),transparent 50%)}
-.auth-hero-content{position:relative;z-index:1;color:#fff;max-width:420px}
-.auth-hero-content h1{font-size:42px;font-weight:800;line-height:1.1;margin-bottom:16px;letter-spacing:-.5px}
-.auth-hero-content p{font-size:17px;opacity:.92;line-height:1.6;margin-bottom:32px}
-.auth-feat{display:flex;flex-direction:column;gap:14px}
-.auth-feat div{display:flex;align-items:center;gap:12px;font-size:15px;opacity:.95}
-.auth-feat .ic{width:38px;height:38px;border-radius:10px;background:rgba(255,255,255,.18);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0;backdrop-filter:blur(8px)}
-.auth-panel{display:flex;align-items:center;justify-content:center;padding:32px}
-.auth-card{width:100%;max-width:400px}
-.auth-logo{display:flex;align-items:center;gap:12px;margin-bottom:32px}
-.auth-logo .mark{width:48px;height:48px;border-radius:14px;background:var(--red-grad);display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:0 6px 20px rgba(225,29,42,.4)}
-.auth-logo .txt{font-size:22px;font-weight:800;letter-spacing:-.3px}
-.auth-logo .txt span{color:var(--red-l)}
-.auth-card h2{font-size:26px;font-weight:700;margin-bottom:6px}
-.auth-card .sub{color:var(--mut);font-size:15px;margin-bottom:28px}
-.field{margin-bottom:18px}
-.field label{display:block;font-size:13px;font-weight:600;color:var(--txt-2);margin-bottom:7px}
-.field input{width:100%;padding:14px 16px;border-radius:var(--radius-sm);border:1.5px solid var(--line);background:var(--bg-2);color:var(--txt);font-size:15px;transition:.15s}
-.field input:focus{border-color:var(--red);box-shadow:0 0 0 3px rgba(225,29,42,.15)}
-.field input::placeholder{color:var(--mut-2)}
-.field .pw-wrap{position:relative}
-.field .pw-toggle{position:absolute;right:14px;top:50%;transform:translateY(-50%);background:none;color:var(--mut);font-size:18px;padding:4px}
-.btn-red{width:100%;padding:15px;border-radius:var(--radius-sm);background:var(--red-grad);color:#fff;font-size:16px;font-weight:700;transition:.15s;box-shadow:0 6px 18px rgba(225,29,42,.35)}
-.btn-red:hover{transform:translateY(-1px);box-shadow:0 8px 24px rgba(225,29,42,.45)}
-.btn-red:active{transform:translateY(0)}
-.btn-red:disabled{opacity:.6;cursor:not-allowed;transform:none}
-.auth-switch{text-align:center;margin-top:22px;font-size:14px;color:var(--mut)}
-.auth-switch a{font-weight:600}
-.auth-err{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.3);color:var(--err);padding:12px 14px;border-radius:var(--radius-sm);font-size:14px;margin-bottom:18px;display:none}
-.auth-err.show{display:block}
-.auth-ok{background:var(--ok-bg);border:1px solid rgba(52,211,153,.3);color:var(--ok);padding:12px 14px;border-radius:var(--radius-sm);font-size:14px;margin-bottom:18px;display:none}
-.auth-ok.show{display:block}
-.divider{display:flex;align-items:center;gap:12px;margin:22px 0;color:var(--mut-2);font-size:13px}
-.divider::before,.divider::after{content:"";flex:1;height:1px;background:var(--line)}
-
-/* ===== App Shell ===== */
-.app{display:flex;min-height:100vh}
-.sidebar{width:248px;background:var(--bg-2);border-right:1px solid var(--line);display:flex;flex-direction:column;position:fixed;top:0;left:0;bottom:0;z-index:50;transition:transform .25s}
-.sidebar-brand{padding:22px 20px;display:flex;align-items:center;gap:11px;border-bottom:1px solid var(--line)}
-.sidebar-brand .mark{width:40px;height:40px;border-radius:11px;background:var(--red-grad);display:flex;align-items:center;justify-content:center;font-size:20px;box-shadow:0 4px 14px rgba(225,29,42,.4)}
-.sidebar-brand .name{font-size:18px;font-weight:800;letter-spacing:-.2px}
-.sidebar-brand .name span{color:var(--red-l)}
-.nav{flex:1;padding:14px 12px;overflow-y:auto}
-.nav-section{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:var(--mut-2);padding:18px 12px 8px}
-.nav-item{display:flex;align-items:center;gap:12px;padding:11px 14px;border-radius:var(--radius-sm);color:var(--txt-2);font-size:14.5px;font-weight:500;cursor:pointer;transition:.12s;margin-bottom:2px}
-.nav-item:hover{background:var(--card);color:var(--txt)}
-.nav-item.active{background:rgba(225,29,42,.14);color:var(--red-l);font-weight:600}
-.nav-item .ic{width:22px;text-align:center;font-size:17px}
-.nav-badge{margin-left:auto;background:var(--red);color:#fff;font-size:11px;font-weight:700;padding:2px 7px;border-radius:8px}
-.sidebar-foot{padding:14px;border-top:1px solid var(--line)}
-.user-chip{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:var(--radius-sm);cursor:pointer;transition:.12s}
-.user-chip:hover{background:var(--card)}
-.user-avatar{width:36px;height:36px;border-radius:10px;background:var(--red-grad);display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;color:#fff;flex-shrink:0}
-.user-info{flex:1;min-width:0}
-.user-info .nm{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.user-info .em{font-size:12px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.user-menu{position:absolute;bottom:70px;left:14px;right:14px;background:var(--card);border:1px solid var(--line);border-radius:var(--radius-sm);box-shadow:var(--shadow);padding:6px;display:none;z-index:60}
-.user-menu.show{display:block}
-.user-menu button{display:flex;align-items:center;gap:10px;width:100%;padding:10px 12px;border-radius:8px;background:none;color:var(--txt-2);font-size:14px;text-align:left}
-.user-menu button:hover{background:var(--card-2);color:var(--txt)}
-
-.main{flex:1;margin-left:248px;min-width:0;display:flex;flex-direction:column;min-height:100vh}
-.topbar{height:64px;background:var(--bg-2);border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 24px;gap:16px;position:sticky;top:0;z-index:40;backdrop-filter:blur(10px)}
-.topbar .menu-btn{display:none;background:none;color:var(--txt);font-size:22px;padding:6px}
-.topbar h1{font-size:20px;font-weight:700;flex:1}
-.topbar .tb-actions{display:flex;align-items:center;gap:12px}
-.tb-pill{display:flex;align-items:center;gap:7px;padding:7px 13px;border-radius:20px;background:var(--card);font-size:13px;color:var(--txt-2);font-weight:500}
-.tb-pill .dot{width:8px;height:8px;border-radius:50%;background:var(--ok)}
-.tb-pill.warn .dot{background:var(--warn)}
-.tb-pill.err .dot{background:var(--err)}
-.content{flex:1;padding:28px 24px;max-width:1400px;width:100%}
-.page{display:none;animation:fade .25s ease}
-.page.on{display:block}
-@keyframes fade{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
-@keyframes spin{to{transform:rotate(360deg)}}
-
-/* ===== Cards / Grid ===== */
-.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:20px}
-.card-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
-.card-head h3{font-size:17px;font-weight:700}
-.card-sub{color:var(--mut);font-size:13.5px;margin-top:-8px;margin-bottom:16px}
-.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:24px}
-.stat{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:20px;position:relative;overflow:hidden}
-.stat::before{content:"";position:absolute;top:0;left:0;right:0;height:3px;background:var(--red-grad)}
-.stat .ic{width:44px;height:44px;border-radius:12px;background:rgba(225,29,42,.12);display:flex;align-items:center;justify-content:center;font-size:22px;margin-bottom:14px}
-.stat .lbl{font-size:13px;color:var(--mut);font-weight:500;margin-bottom:4px}
-.stat .val{font-size:30px;font-weight:800;letter-spacing:-.5px}
-.stat .trend{font-size:12.5px;color:var(--ok);margin-top:6px;font-weight:600}
-.tool-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px}
-.tool-card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:22px;cursor:pointer;transition:.18s;position:relative;overflow:hidden}
-.tool-card:hover{border-color:var(--red);transform:translateY(-3px);box-shadow:0 10px 28px rgba(0,0,0,.3)}
-.tool-card::after{content:"";position:absolute;bottom:0;left:0;right:0;height:0;background:var(--red-grad);transition:.18s}
-.tool-card:hover::after{height:3px}
-.tool-card .ic{width:52px;height:52px;border-radius:14px;background:rgba(225,29,42,.1);display:flex;align-items:center;justify-content:center;font-size:26px;margin-bottom:14px;transition:.18s}
-.tool-card:hover .ic{background:var(--red-grad);box-shadow:0 6px 18px rgba(225,29,42,.4)}
-.tool-card h4{font-size:16.5px;font-weight:700;margin-bottom:5px}
-.tool-card p{font-size:13px;color:var(--mut);line-height:1.5}
-.tool-card .lock{position:absolute;top:14px;right:14px;font-size:16px;color:var(--mut-2)}
-
-/* ===== Buttons ===== */
-.btn{padding:11px 20px;border-radius:var(--radius-sm);font-size:14.5px;font-weight:600;transition:.15s;display:inline-flex;align-items:center;gap:8px}
-.btn-primary{background:var(--red-grad);color:#fff;box-shadow:0 4px 14px rgba(225,29,42,.3)}
-.btn-primary:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(225,29,42,.4)}
-.btn-ghost{background:var(--card-2);color:var(--txt-2);border:1px solid var(--line)}
-.btn-ghost:hover{background:var(--card-hi);color:var(--txt)}
-.btn-sm{padding:8px 14px;font-size:13px}
-.btn:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
-
-/* ===== Editor ===== */
-.editor-wrap{display:grid;grid-template-columns:300px 1fr 280px;gap:16px;height:calc(100vh - 64px - 56px);min-height:560px}
-.editor-side{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);overflow-y:auto;max-height:100%}
-.editor-side h4{font-size:14px;font-weight:700;padding:16px 16px 10px;color:var(--txt-2);position:sticky;top:0;background:var(--card);z-index:5;border-bottom:1px solid var(--line)}
-.tool-tabs{display:flex;gap:2px;padding:8px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--card);z-index:10;overflow-x:auto}
-.tool-tab{flex:1;padding:10px 8px;border-radius:8px;background:none;color:var(--mut);font-size:13px;font-weight:600;white-space:nowrap;transition:.12s;text-align:center}
-.tool-tab:hover{background:var(--card-2);color:var(--txt-2)}
-.tool-tab.active{background:rgba(225,29,42,.15);color:var(--red-l)}
-.tool-panel{padding:16px;display:none}
-.tool-panel.on{display:block}
-.ctrl{margin-bottom:18px}
-.ctrl-lbl{display:flex;justify-content:space-between;align-items:center;font-size:13px;font-weight:600;color:var(--txt-2);margin-bottom:8px}
-.ctrl-val{font-size:12px;color:var(--mut);background:var(--bg-2);padding:2px 8px;border-radius:6px}
-.slider{width:100%;-webkit-appearance:none;appearance:none;height:6px;border-radius:4px;background:var(--line);outline:none}
-.slider::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;background:var(--red);cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.4);border:2px solid #fff}
-.slider::-moz-range-thumb{width:18px;height:18px;border-radius:50%;background:var(--red);cursor:pointer;border:2px solid #fff}
-.ctrl-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
-.ctrl-row .ctrl{margin-bottom:0}
-.seg{display:flex;gap:4px;background:var(--bg-2);border-radius:10px;padding:4px;margin-bottom:14px}
-.seg button{flex:1;padding:8px;border-radius:7px;background:none;color:var(--mut);font-size:13px;font-weight:600;transition:.12s}
-.seg button.active{background:var(--card-hi);color:var(--red-l);box-shadow:0 1px 4px rgba(0,0,0,.2)}
-.filter-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.filter-cell{cursor:pointer;border-radius:10px;overflow:hidden;border:2px solid transparent;transition:.15s;position:relative}
-.filter-cell.active{border-color:var(--red)}
-.filter-cell img{width:100%;aspect-ratio:1;object-fit:cover;display:block}
-.filter-cell .fn{position:absolute;bottom:0;left:0;right:0;background:linear-gradient(transparent,rgba(0,0,0,.8));color:#fff;font-size:11px;font-weight:600;padding:14px 8px 6px;text-align:center;text-transform:capitalize}
-.canvas-area{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);display:flex;flex-direction:column;overflow:hidden}
-.canvas-toolbar{display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
-.canvas-stage{flex:1;display:flex;align-items:center;justify-content:center;background:repeating-conic-gradient(#1a1d26 0% 25%,#16181f 0% 50%) 50%/24px 24px;position:relative;overflow:hidden;min-height:300px}
-#editorCanvas{max-width:100%;max-height:100%;border-radius:6px;box-shadow:0 4px 24px rgba(0,0,0,.5)}
-.canvas-empty{position:absolute;text-align:center;color:var(--mut)}
-.canvas-empty .big{font-size:56px;margin-bottom:12px;opacity:.4}
-.canvas-empty p{font-size:15px;margin-bottom:6px}
-.canvas-empty small{font-size:13px;color:var(--mut-2)}
-.canvas-status{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-top:1px solid var(--line);font-size:12.5px;color:var(--mut)}
-.history-side{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);overflow-y:auto;max-height:100%}
-.history-item{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line);font-size:13px;cursor:pointer;transition:.12s}
-.history-item:hover{background:var(--card-2)}
-.history-item.current{background:rgba(225,29,42,.1);border-left:3px solid var(--red)}
-.history-item .ic{font-size:16px;opacity:.7}
-.export-opts{padding:16px}
-.exp-fmt{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px}
-.exp-fmt button{padding:10px;border-radius:8px;background:var(--bg-2);border:1.5px solid var(--line);color:var(--txt-2);font-size:13px;font-weight:600;transition:.12s}
-.exp-fmt button.active{border-color:var(--red);background:rgba(225,29,42,.1);color:var(--red-l)}
-.exp-q{margin-bottom:14px}
-.dz{border:2px dashed var(--line-2);border-radius:14px;padding:40px 20px;text-align:center;color:var(--mut);cursor:pointer;transition:.15s}
-.dz:hover,.dz.over{border-color:var(--red);background:rgba(225,29,42,.04);color:var(--red-l)}
-.dz .big{font-size:48px;margin-bottom:12px;opacity:.5}
-.dz p{font-size:15px;margin-bottom:4px}
-.dz small{font-size:13px;color:var(--mut-2)}
-
-/* ===== Tables ===== */
-.tbl-wrap{overflow-x:auto;border-radius:var(--radius);border:1px solid var(--line)}
-table.tbl{width:100%;border-collapse:collapse;background:var(--card);font-size:14px}
-table.tbl th{background:var(--card-2);padding:13px 16px;text-align:left;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--mut);border-bottom:1px solid var(--line);white-space:nowrap}
-table.tbl td{padding:13px 16px;border-bottom:1px solid var(--line);color:var(--txt-2)}
-table.tbl tr:hover td{background:rgba(255,255,255,.02)}
-table.tbl tr:last-child td{border-bottom:none}
-.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:12px;font-weight:600}
-.badge.ok{background:var(--ok-bg);color:var(--ok)}
-.badge.bad{background:rgba(248,113,113,.12);color:var(--err)}
-.badge.warn{background:rgba(251,191,36,.12);color:var(--warn)}
-.badge.mut{background:var(--bg-2);color:var(--mut)}
-.badge.admin{background:rgba(225,29,42,.12);color:var(--red-l)}
-.row-act{display:flex;gap:6px}
-.row-act button{padding:7px 10px;border-radius:7px;background:var(--card-2);color:var(--txt-2);font-size:12px;font-weight:600;border:1px solid var(--line);transition:.12s}
-.row-act button:hover{background:var(--card-hi)}
-.row-act button.danger:hover{background:rgba(248,113,113,.15);color:var(--err);border-color:rgba(248,113,113,.3)}
-.row-act button.ok-btn:hover{background:rgba(52,211,153,.15);color:var(--ok);border-color:rgba(52,211,153,.3)}
-
-/* ===== Toggle ===== */
-.toggle{position:relative;width:42px;height:24px;display:inline-block}
-.toggle input{display:none}
-.toggle .track{position:absolute;inset:0;background:var(--line);border-radius:14px;transition:.2s}
-.toggle .thumb{position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.3)}
-.toggle input:checked+.track{background:var(--red)}
-.toggle input:checked+.track+.thumb{transform:translateX(18px)}
-
-/* ===== Forms ===== */
-.form-row{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
-.form-row.full{grid-template-columns:1fr}
-.form-field label{display:block;font-size:13px;font-weight:600;color:var(--txt-2);margin-bottom:7px}
-.form-field input,.form-field select,.form-field textarea{width:100%;padding:11px 14px;border-radius:var(--radius-sm);border:1.5px solid var(--line);background:var(--bg-2);color:var(--txt);font-size:14px;transition:.15s}
-.form-field input:focus,.form-field select:focus,.form-field textarea:focus{border-color:var(--red);box-shadow:0 0 0 3px rgba(225,29,42,.12)}
-.form-field textarea{resize:vertical;min-height:80px}
-
-/* ===== Maintenance banner ===== */
-.maint-banner{background:linear-gradient(90deg,rgba(251,191,36,.15),rgba(251,191,36,.05));border:1px solid rgba(251,191,36,.3);border-radius:var(--radius);padding:14px 18px;display:flex;align-items:center;gap:12px;margin-bottom:20px;color:var(--warn);font-size:14px;font-weight:600}
-
-/* ===== Toast ===== */
-#toast{position:fixed;bottom:24px;right:24px;z-index:200;display:flex;flex-direction:column;gap:10px}
-.toast{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--red);border-radius:var(--radius-sm);padding:14px 18px;min-width:280px;box-shadow:var(--shadow);display:flex;align-items:center;gap:12px;font-size:14px;animation:slideIn .25s ease;max-width:380px}
-.toast.ok{border-left-color:var(--ok)}
-.toast.err{border-left-color:var(--err)}
-.toast.warn{border-left-color:var(--warn)}
-.toast .ic{font-size:18px}
-.toast .msg{flex:1}
-.toast .x{color:var(--mut);background:none;font-size:16px;padding:2px}
-@keyframes slideIn{from{opacity:0;transform:translateX(40px)}to{opacity:1;transform:translateX(0)}}
-
-/* ===== Spinner ===== */
-.spinner{width:22px;height:22px;border:2.5px solid var(--line);border-top-color:var(--red);border-radius:50%;animation:spin .7s linear infinite;display:inline-block;vertical-align:middle}
-.overlay-spin{position:absolute;inset:0;background:rgba(14,15,19,.7);display:flex;align-items:center;justify-content:center;z-index:30;flex-direction:column;gap:14px;color:var(--txt-2);font-size:14px;backdrop-filter:blur(4px);border-radius:var(--radius)}
-
-/* ===== Modal ===== */
-.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:100;display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px);display:none}
-.modal-bg.show{display:flex}
-.modal{background:var(--card);border:1px solid var(--line);border-radius:var(--radius-lg);padding:28px;max-width:480px;width:100%;box-shadow:var(--shadow);animation:modalIn .2s ease}
-@keyframes modalIn{from{opacity:0;transform:scale(.95)}to{opacity:1;transform:scale(1)}}
-.modal h3{font-size:20px;font-weight:700;margin-bottom:6px}
-.modal p{color:var(--mut);font-size:14px;margin-bottom:20px}
-.modal .acts{display:flex;gap:10px;justify-content:flex-end;margin-top:20px}
-
-/* ===== Empty state ===== */
-.empty{text-align:center;padding:48px 20px;color:var(--mut)}
-.empty .big{font-size:48px;opacity:.4;margin-bottom:14px}
-.empty h4{font-size:17px;color:var(--txt-2);margin-bottom:6px}
-.empty p{font-size:14px}
-
-/* ===== Responsive ===== */
-@media(max-width:1100px){.editor-wrap{grid-template-columns:260px 1fr 240px}}
-@media(max-width:900px){
-  .sidebar{transform:translateX(-100%)}
-  .sidebar.open{transform:translateX(0)}
-  .main{margin-left:0}
-  .topbar .menu-btn{display:block}
-  .auth-wrap{grid-template-columns:1fr}
-  .auth-hero{display:none}
-  .editor-wrap{grid-template-columns:1fr;grid-template-rows:auto 1fr auto;height:auto}
-  .editor-side,.history-side{max-height:260px}
-}
-@media(max-width:600px){
-  .content{padding:18px 14px}
-  .topbar{padding:0 14px}
-  .stat-grid{grid-template-columns:1fr}
-  .form-row{grid-template-columns:1fr}
-  .tb-pill .lbl{display:none}
-}
-.scrim{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:45;display:none}
-.scrim.show{display:block}
-</style>
-</head>
-<body>
-<!-- AUTH VIEW -->
-<div id="authView" class="auth-wrap">
-  <div class="auth-hero">
-    <div class="auth-hero-content">
-      <h1>Photo Studio<br>Pro</h1>
-      <p>A premium, professional photo editing studio in your browser. Crop, enhance, retouch, and export print-ready photos — all in one place.</p>
-      <div class="auth-feat">
-        <div><span class="ic">✨</span> Pro-grade adjustments &amp; filters</div>
-        <div><span class="ic">🖨</span> Print-ready passport &amp; A4 layouts</div>
-        <div><span class="ic">🔒</span> Private — auto-deletes your uploads</div>
-      </div>
-    </div>
-  </div>
-  <div class="auth-panel">
-    <div class="auth-card">
-      <div class="auth-logo">
-        <div class="mark">📸</div>
-        <div class="txt">Photo<span>Studio</span></div>
-      </div>
-      <div id="authForm">
-        <h2 id="authTitle">Welcome back</h2>
-        <p class="sub" id="authSub">Sign in to access your studio.</p>
-        <div class="auth-err" id="authErr"></div>
-        <div class="auth-ok" id="authOk"></div>
-        <form id="loginForm">
-          <div class="field">
-            <label>Email</label>
-            <input type="email" id="loginEmail" placeholder="you@example.com" required autocomplete="email">
-          </div>
-          <div class="field">
-            <label>Password</label>
-            <div class="pw-wrap">
-              <input type="password" id="loginPw" placeholder="••••••••" required autocomplete="current-password">
-              <button type="button" class="pw-toggle" onclick="togglePw('loginPw',this)">👁</button>
-            </div>
-          </div>
-          <button type="submit" class="btn-red" id="loginBtn">Sign In →</button>
-        </form>
-        <form id="registerForm" style="display:none">
-          <div class="field">
-            <label>Display Name</label>
-            <input type="text" id="regName" placeholder="Your name" autocomplete="name">
-          </div>
-          <div class="field">
-            <label>Email</label>
-            <input type="email" id="regEmail" placeholder="you@example.com" required autocomplete="email">
-          </div>
-          <div class="field">
-            <label>Password</label>
-            <div class="pw-wrap">
-              <input type="password" id="regPw" placeholder="At least 8 characters" required minlength="8" autocomplete="new-password">
-              <button type="button" class="pw-toggle" onclick="togglePw('regPw',this)">👁</button>
-            </div>
-          </div>
-          <button type="submit" class="btn-red" id="regBtn">Create Account →</button>
-        </form>
-        <div class="auth-switch" id="authSwitch">
-          Don't have an account? <a href="#" onclick="showRegister();return false">Create one</a>
-        </div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- APP VIEW -->
-<div id="appView" style="display:none">
-<div class="scrim" id="scrim" onclick="closeSidebar()"></div>
-<div class="app">
-  <aside class="sidebar" id="sidebar">
-    <div class="sidebar-brand">
-      <div class="mark">📸</div>
-      <div class="name">Photo<span>Studio</span></div>
-    </div>
-    <nav class="nav" id="navList">
-      <div class="nav-section">Main</div>
-      <div class="nav-item active" data-page="dashboard"><span class="ic">📊</span> Dashboard</div>
-      <div class="nav-item" data-page="editor"><span class="ic">🎨</span> Photo Editor</div>
-      <div class="nav-item" data-page="passport"><span class="ic">📄</span> Passport Maker</div>
-      <div class="nav-section">Account</div>
-      <div class="nav-item" data-page="myactivity"><span class="ic">🕐</span> My Activity</div>
-      <div class="nav-item" data-page="settings"><span class="ic">⚙️</span> Settings</div>
-      <div class="nav-section" id="adminNavSection" style="display:none">Administration</div>
-      <div class="nav-item" data-page="admin-users" id="adminUsersNav" style="display:none"><span class="ic">👥</span> Users</div>
-      <div class="nav-item" data-page="admin-activity" id="adminActNav" style="display:none"><span class="ic">📈</span> Activity Log</div>
-      <div class="nav-item" data-page="admin-features" id="adminFeatNav" style="display:none"><span class="ic">🧩</span> Features</div>
-      <div class="nav-item" data-page="admin-settings" id="adminSetNav" style="display:none"><span class="ic">🔧</span> System</div>
-    </nav>
-    <div class="sidebar-foot">
-      <div style="position:relative">
-        <div class="user-chip" id="userChip" onclick="toggleUserMenu()">
-          <div class="user-avatar" id="userAvatar">U</div>
-          <div class="user-info">
-            <div class="nm" id="userName">User</div>
-            <div class="em" id="userEmail">user@email.com</div>
-          </div>
-          <span style="color:var(--mut)">⌄</span>
-        </div>
-        <div class="user-menu" id="userMenu">
-          <button onclick="goPage('settings')"><span>⚙️</span> Account Settings</button>
-          <button onclick="logout()"><span style="color:var(--err)">⏻</span> <span style="color:var(--err)">Sign Out</span></button>
-        </div>
-      </div>
-    </div>
-  </aside>
-
-  <main class="main">
-    <div class="topbar">
-      <button class="menu-btn" onclick="openSidebar()">☰</button>
-      <h1 id="pageTitle">Dashboard</h1>
-      <div class="tb-actions">
-        <div class="tb-pill" id="statusPill"><span class="dot"></span><span class="lbl">All Systems Operational</span></div>
-      </div>
-    </div>
-    <div class="content">
-
-      <!-- DASHBOARD -->
-      <div class="page on" id="page-dashboard">
-        <div id="dashMaintBanner"></div>
-        <div class="stat-grid">
-          <div class="stat"><div class="ic">🖼</div><div class="lbl">Total Edits</div><div class="val" id="statEdits">0</div></div>
-          <div class="stat"><div class="ic">📄</div><div class="lbl">Passport Sheets</div><div class="val" id="statPassports">0</div></div>
-          <div class="stat"><div class="ic">📤</div><div class="lbl">Files Exported</div><div class="val" id="statExports">0</div></div>
-          <div class="stat"><div class="ic">📅</div><div class="lbl">Member Since</div><div class="val" id="statSince" style="font-size:18px">—</div></div>
-        </div>
-        <div class="card">
-          <div class="card-head"><h3>Quick Tools</h3></div>
-          <p class="card-sub">Jump straight into your workflow.</p>
-          <div class="tool-grid">
-            <div class="tool-card" onclick="goPage('editor')"><div class="ic">🎨</div><h4>Photo Editor</h4><p>Full adjustment suite: brightness, contrast, exposure, color, filters &amp; more.</p></div>
-            <div class="tool-card" onclick="startPassportEditor()"><div class="ic">📄</div><h4>Passport Maker</h4><p>Generate print-ready passport photo sheets at 300 DPI.</p></div>
-            <div class="tool-card" onclick="goPage('editor');setTimeout(()=>{if(document.getElementById('fileInput'))document.getElementById('fileInput').click()},300)"><div class="ic">✨</div><h4>Quick Enhance</h4><p>Auto-enhance any photo with one click — perfect for printing.</p></div>
-            <div class="tool-card" onclick="goPage('editor');setTimeout(()=>{if(document.getElementById('fileInput'))document.getElementById('fileInput').click()},300)"><div class="ic">✂️</div><h4>Crop &amp; Resize</h4><p>Smart crop to any aspect ratio or custom dimensions.</p></div>
-          </div>
-        </div>
-      </div>
-
-      <!-- PHOTO EDITOR -->
-      <div class="page" id="page-editor">
-        <div id="editorMaintBanner"></div>
-        <div class="editor-wrap">
-          <div class="editor-side">
-            <div class="dz" id="dz" onclick="document.getElementById('fileInput').click()">
-              <div class="big">📁</div>
-              <p>Upload an image</p>
-              <small>JPG, PNG, WEBP — up to 25 MB</small>
-            </div>
-            <input type="file" id="fileInput" accept="image/*" style="display:none">
-            <div class="tool-tabs">
-              <button class="tool-tab active" data-tab="adjust">Adjust</button>
-              <button class="tool-tab" data-tab="filters">Filters</button>
-              <button class="tool-tab" data-tab="crop">Crop</button>
-              <button class="tool-tab" data-tab="bg">Background</button>
-              <button class="tool-tab" data-tab="export">Export</button>
-            </div>
-            <div class="tool-panel on" id="panel-adjust">
-              <div class="ctrl"><div class="ctrl-lbl"><span>⚡ Auto Enhance</span></div><button class="btn btn-primary btn-sm" style="width:100%" onclick="applyAutoEnhance()">✨ Auto Enhance Photo</button></div>
-              <div class="ctrl"><div class="ctrl-lbl"><span>Brightness</span><span class="ctrl-val" id="vBrightness">100%</span></div><input type="range" class="slider" id="brightness" min="0" max="200" value="100" oninput="onAdjust()"></div>
-              <div class="ctrl"><div class="ctrl-lbl"><span>Contrast</span><span class="ctrl-val" id="vContrast">100%</span></div><input type="range" class="slider" id="contrast" min="0" max="200" value="100" oninput="onAdjust()"></div>
-              <div class="ctrl"><div class="ctrl-lbl"><span>Exposure</span><span class="ctrl-val" id="vExposure">0</span></div><input type="range" class="slider" id="exposure" min="-200" max="200" value="0" oninput="onAdjust()"></div>
-              <div class="ctrl"><div class="ctrl-lbl"><span>Sharpness</span><span class="ctrl-val" id="vSharpness">100%</span></div><input type="range" class="slider" id="sharpness" min="0" max="300" value="100" oninput="onAdjust()"></div>
-              <div class="ctrl"><div class="ctrl-lbl"><span>Saturation</span><span class="ctrl-val" id="vSaturation">100%</span></div><input type="range" class="slider" id="saturation" min="0" max="200" value="100" oninput="onAdjust()"></div>
-              <div class="ctrl"><div class="ctrl-lbl"><span>Temperature</span><span class="ctrl-val" id="vTemp">0</span></div><input type="range" class="slider" id="temperature" min="-100" max="100" value="0" oninput="onAdjust()"></div>
-              <div class="ctrl"><div class="ctrl-lbl"><span>Tint</span><span class="ctrl-val" id="vTint">0</span></div><input type="range" class="slider" id="tint" min="-100" max="100" value="0" oninput="onAdjust()"></div>
-            </div>
-            <div class="tool-panel" id="panel-filters">
-              <div class="filter-grid" id="filterGrid"></div>
-            </div>
-            <div class="tool-panel" id="panel-crop">
-              <div class="seg" id="flipSeg">
-                <button onclick="doFlip('horizontal')">↔ Flip H</button>
-                <button onclick="doFlip('vertical')">↕ Flip V</button>
-              </div>
-              <div class="ctrl"><div class="ctrl-lbl"><span>Rotate</span><span class="ctrl-val" id="vRotate">0°</span></div><input type="range" class="slider" id="rotate" min="-180" max="180" value="0" oninput="document.getElementById('vRotate').textContent=this.value+'°'"></div>
-              <div style="display:flex;gap:8px;margin-bottom:14px"><button class="btn btn-ghost btn-sm" style="flex:1" onclick="doRotate(-90)">⟲ -90°</button><button class="btn btn-ghost btn-sm" style="flex:1" onclick="doRotate(90)">⟳ 90°</button></div>
-              <h4 style="font-size:13px;color:var(--mut);margin-bottom:10px">Crop to Aspect Ratio</h4>
-              <div class="seg" id="ratioSeg">
-                <button data-r="0" class="active">Free</button>
-                <button data-r="1">1:1</button>
-                <button data-r="1.7778">16:9</button>
-                <button data-r="1.3333">4:3</button>
-                <button data-r="0.75">3:4</button>
-                <button data-r="0.6667">2:3</button>
-              </div>
-              <div class="ctrl"><div class="ctrl-lbl"><span>Custom Size (px)</span></div>
-                <div class="ctrl-row">
-                  <div class="form-field"><input type="number" id="resizeW" placeholder="Width" min="1"></div>
-                  <div class="form-field"><input type="number" id="resizeH" placeholder="Height" min="1"></div>
-                </div>
-                <button class="btn btn-ghost btn-sm" style="width:100%" onclick="doResize()">Apply Resize</button>
-              </div>
-            </div>
-            <div class="tool-panel" id="panel-bg">
-              <p style="font-size:13px;color:var(--mut);margin-bottom:14px">Replace or remove the photo background automatically.</p>
-              <div class="ctrl"><div class="ctrl-lbl"><span>Replace Background Color</span></div>
-                <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px">
-                  <div onclick="setBgColor('#1e69f3')" style="height:36px;border-radius:8px;background:#1e69f3;cursor:pointer;border:2px solid var(--line)"></div>
-                  <div onclick="setBgColor('#d33f3f')" style="height:36px;border-radius:8px;background:#d33f3f;cursor:pointer;border:2px solid var(--line)"></div>
-                  <div onclick="setBgColor('#ffffff')" style="height:36px;border-radius:8px;background:#ffffff;cursor:pointer;border:2px solid var(--line)"></div>
-                  <div onclick="setBgColor('#2e7d32')" style="height:36px;border-radius:8px;background:#2e7d32;cursor:pointer;border:2px solid var(--line)"></div>
-                </div>
-                <div class="form-field"><input type="text" id="bgHex" placeholder="#FFFFFF" maxlength="7"><button class="btn btn-primary btn-sm" style="width:100%;margin-top:8px" onclick="applyBgReplace()">Replace Background</button></div>
-              </div>
-              <hr style="border:none;border-top:1px solid var(--line);margin:16px 0">
-              <button class="btn btn-ghost btn-sm" style="width:100%" onclick="applyRemoveBg()">🗑 Remove Background (Transparent)</button>
-            </div>
-            <div class="tool-panel" id="panel-export">
-              <div class="export-opts">
-                <h4 style="font-size:13px;color:var(--mut);margin-bottom:10px">Export Format</h4>
-                <div class="exp-fmt" id="expFmt">
-                  <button data-f="jpg" class="active">JPG</button>
-                  <button data-f="png">PNG</button>
-                  <button data-f="webp">WEBP</button>
-                  <button data-f="bmp">BMP</button>
-                </div>
-                <div class="exp-q">
-                  <div class="ctrl-lbl"><span>Quality</span><span class="ctrl-val" id="vExpQ">95</span></div>
-                  <input type="range" class="slider" id="expQuality" min="10" max="100" value="95" oninput="document.getElementById('vExpQ').textContent=this.value">
-                </div>
-                <button class="btn btn-primary" style="width:100%" onclick="exportImage()">⬇ Download Image</button>
-                <hr style="border:none;border-top:1px solid var(--line);margin:16px 0">
-                <h4 style="font-size:13px;color:var(--mut);margin-bottom:10px">Compress Image</h4>
-                <button class="btn btn-ghost btn-sm" style="width:100%" onclick="compressImage()">🗜 Compress (smart quality)</button>
-              </div>
-            </div>
-          </div>
-          <div class="canvas-area">
-            <div class="canvas-toolbar">
-              <button class="btn btn-ghost btn-sm" id="undoBtn" onclick="undo()" disabled>↩ Undo</button>
-              <button class="btn btn-ghost btn-sm" id="redoBtn" onclick="redo()" disabled>↪ Redo</button>
-              <button class="btn btn-ghost btn-sm" onclick="resetAll()">↺ Reset</button>
-              <button class="btn btn-ghost btn-sm" onclick="toggleBeforeAfter()" id="baBtn">👁 Before/After</button>
-              <div style="flex:1"></div>
-              <button class="btn btn-ghost btn-sm" onclick="document.getElementById('fileInput').click()">📂 New Image</button>
-            </div>
-            <div class="canvas-stage" id="canvasStage">
-              <canvas id="editorCanvas" style="display:none"></canvas>
-              <div class="canvas-empty" id="canvasEmpty">
-                <div class="big">🖼</div>
-                <p>No image loaded</p>
-                <small>Upload an image to start editing</small>
-              </div>
-              <div class="overlay-spin" id="processingSpin" style="display:none"><div class="spinner"></div><div id="processingMsg">Processing…</div></div>
-            </div>
-            <div class="canvas-status">
-              <span id="imgInfo">—</span>
-              <span id="zoomInfo">100%</span>
-            </div>
-          </div>
-          <div class="history-side">
-            <h4 style="padding:16px;font-size:14px;font-weight:700;border-bottom:1px solid var(--line)">History</h4>
-            <div id="historyList">
-              <div class="empty" style="padding:24px 12px"><p style="font-size:13px">Edits will appear here</p></div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- PASSPORT MAKER -->
-      <div class="page" id="page-passport">
-        <div id="passportMaintBanner"></div>
-        <div class="card" style="margin-bottom:20px">
-          <div class="card-head"><h3>📄 Passport Photo Maker</h3></div>
-          <p class="card-sub">Upload a photo and generate print-ready sheets at 300 DPI with exact physical sizes.</p>
-          <div class="dz" id="psDz" onclick="document.getElementById('psFileInput').click()">
-            <div class="big">📁</div><p>Upload a photo</p><small>JPG, PNG — up to 25 MB</small>
-          </div>
-          <input type="file" id="psFileInput" accept="image/*" style="display:none">
-          <div id="psForm" style="display:none">
-            <img id="psPreview" style="max-width:200px;border-radius:10px;margin:14px 0;display:block">
-            <div class="form-row">
-              <div class="form-field"><label>Page Size</label><select id="psPage"><option value="A4">A4 (210×297mm)</option><option value="A3">A3</option><option value="A5">A5</option><option value="Letter">Letter</option><option value="Legal">Legal</option><option value="custom">Custom</option></select></div>
-              <div class="form-field"><label>Photo Size</label><select id="psPhoto"><option value="25x35">25×35 mm</option><option value="30x40">30×40 mm</option><option value="35x45" selected>35×45 mm</option><option value="2x2">2×2 inch</option><option value="custom">Custom</option></select></div>
-            </div>
-            <div class="form-row" id="psCustomPage" style="display:none">
-              <div class="form-field"><label>Page W (mm)</label><input type="number" id="psPW" placeholder="210"></div>
-              <div class="form-field"><label>Page H (mm)</label><input type="number" id="psPH" placeholder="297"></div>
-            </div>
-            <div class="form-row" id="psCustomPhoto" style="display:none">
-              <div class="form-field"><label>Photo W (mm)</label><input type="number" id="psPhW" placeholder="35"></div>
-              <div class="form-field"><label>Photo H (mm)</label><input type="number" id="psPhH" placeholder="45"></div>
-            </div>
-            <div class="form-row">
-              <div class="form-field"><label>Background</label><select id="psBg"><option value="skip">Keep original</option><option value="blue">Blue</option><option value="red">Red</option><option value="white">White</option><option value="green">Green</option><option value="custom">Custom HEX</option></select></div>
-              <div class="form-field"><label>Quantity</label><input type="number" id="psQty" value="8" min="1" max="500"></div>
-            </div>
-            <div class="form-field" id="psBgHex" style="display:none;margin-bottom:16px"><label>Background HEX</label><input type="text" id="psHex" placeholder="#FFFFFF" maxlength="7"></div>
-            <div class="form-row full"><div class="form-field"><label>Output Format</label><select id="psFmt"><option value="pdf">PDF</option><option value="jpg">JPEG</option><option value="png">PNG</option><option value="pdf_jpg">PDF + JPEG</option><option value="pdf_png">PDF + PNG</option></select></div></div>
-            <button class="btn btn-primary" id="psGenBtn" onclick="generatePassport()">🖨 Generate Print Sheet</button>
-            <div id="psResult"></div>
-          </div>
-        </div>
-      </div>
-
-      <!-- MY ACTIVITY -->
-      <div class="page" id="page-myactivity">
-        <div class="card">
-          <div class="card-head"><h3>🕐 My Activity</h3></div>
-          <p class="card-sub">Your recent actions on the platform.</p>
-          <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Action</th><th>Files</th><th>When</th></tr></thead><tbody id="myActBody"><tr><td colspan="3" class="empty">No activity yet.</td></tr></tbody></table></div>
-        </div>
-      </div>
-
-      <!-- SETTINGS -->
-      <div class="page" id="page-settings">
-        <div class="card" style="max-width:600px">
-          <div class="card-head"><h3>⚙️ Account Settings</h3></div>
-          <div class="form-row full"><div class="form-field"><label>Display Name</label><input type="text" id="setName" placeholder="Your name"></div></div>
-          <div class="form-row full"><div class="form-field"><label>Email</label><input type="email" id="setEmail" readonly style="opacity:.6"></div></div>
-          <hr style="border:none;border-top:1px solid var(--line);margin:20px 0">
-          <h4 style="font-size:15px;margin-bottom:14px">Change Password</h4>
-          <div class="form-row full"><div class="form-field"><label>Current Password</label><input type="password" id="setCurPw" placeholder="Current password"></div></div>
-          <div class="form-row"><div class="form-field"><label>New Password</label><input type="password" id="setNewPw" placeholder="New password"></div><div class="form-field"><label>Confirm</label><input type="password" id="setConfPw" placeholder="Confirm"></div></div>
-          <div style="display:flex;gap:10px;margin-top:8px"><button class="btn btn-primary" onclick="saveSettings()">Save Changes</button><button class="btn btn-ghost" onclick="changePassword()">Update Password</button></div>
-        </div>
-      </div>
-
-      <!-- ADMIN: USERS -->
-      <div class="page" id="page-admin-users">
-        <div class="stat-grid">
-          <div class="stat"><div class="ic">👥</div><div class="lbl">Total Users</div><div class="val" id="admTotalUsers">0</div></div>
-          <div class="stat"><div class="ic">✅</div><div class="lbl">Active Users</div><div class="val" id="admActiveUsers">0</div></div>
-          <div class="stat"><div class="ic">🚫</div><div class="lbl">Banned Users</div><div class="val" id="admBannedUsers">0</div></div>
-          <div class="stat"><div class="ic">🔐</div><div class="lbl">Active Sessions</div><div class="val" id="admSessions">0</div></div>
-        </div>
-        <div class="card">
-          <div class="card-head"><h3>👥 User Management</h3><button class="btn btn-primary btn-sm" onclick="loadAdminUsers()">↻ Refresh</button></div>
-          <p class="card-sub">Manage access, bans, and permissions for all users.</p>
-          <div class="tbl-wrap"><table class="tbl"><thead><tr><th>User</th><th>Joined</th><th>Last Login</th><th>Status</th><th>Bot Access</th><th>Actions</th></tr></thead><tbody id="admUsersBody"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody></table></div>
-        </div>
-      </div>
-
-      <!-- ADMIN: ACTIVITY -->
-      <div class="page" id="page-admin-activity">
-        <div class="card">
-          <div class="card-head"><h3>📈 System Activity Log</h3><button class="btn btn-primary btn-sm" onclick="loadAdminActivity()">↻ Refresh</button></div>
-          <p class="card-sub">Recent platform-wide activity.</p>
-          <div class="tbl-wrap"><table class="tbl"><thead><tr><th>User</th><th>Action</th><th>Details</th><th>IP</th><th>When</th></tr></thead><tbody id="admActBody"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody></table></div>
-        </div>
-      </div>
-
-      <!-- ADMIN: FEATURES -->
-      <div class="page" id="page-admin-features">
-        <div class="card" style="max-width:640px">
-          <div class="card-head"><h3>🧩 Feature Toggles</h3></div>
-          <p class="card-sub">Enable or disable features across the platform.</p>
-          <div id="featList"></div>
-          <button class="btn btn-primary" style="margin-top:16px" onclick="saveFeatures()">Save Feature Settings</button>
-        </div>
-      </div>
-
-      <!-- ADMIN: SETTINGS -->
-      <div class="page" id="page-admin-settings">
-        <div class="card" style="max-width:640px">
-          <div class="card-head"><h3>🔧 System Settings</h3></div>
-          <div class="form-row full"><div class="form-field"><label>Site Name</label><input type="text" id="setSiteName"></div></div>
-          <div class="form-row full"><div class="form-field"><label>Max Upload Size (MB)</label><input type="number" id="setMaxUpload" min="1" max="100"></div></div>
-          <div class="form-row"><div class="form-field"><label>Registration Open</label><div style="padding-top:6px"><label class="toggle"><input type="checkbox" id="setRegOpen"><span class="track"></span><span class="thumb"></span></label></div></div><div class="form-field"><label>Maintenance Mode</label><div style="padding-top:6px"><label class="toggle"><input type="checkbox" id="setMaint"><span class="track"></span><span class="thumb"></span></label></div></div></div>
-          <div class="form-row full"><div class="form-field"><label>Maintenance Message</label><textarea id="setMaintMsg" placeholder="Message shown to users during maintenance"></textarea></div></div>
-          <button class="btn btn-primary" style="margin-top:8px" onclick="saveSystemSettings()">Save System Settings</button>
-        </div>
-      </div>
-
-    </div>
-  </main>
-</div>
-</div>
-
-<div id="toast"></div>
-<div class="modal-bg" id="modalBg" onclick="if(event.target===this)closeModal()"><div class="modal" id="modalBox"></div></div>
-
-<script>
-const API = "/api";
-let TOKEN = localStorage.getItem("ps_token") || "";
-let USER = null;
-let currentImage = null;
-let originalImage = null;
-let history = [];
-let historyIdx = -1;
-let showingBefore = false;
-let currentFilter = "original";
-let exportFmt = "jpg";
-
-// ===== Toast =====
-function toast(msg, type="info", dur=3500){
-  const c = document.getElementById("toast");
-  const t = document.createElement("div");
-  t.className = "toast "+type;
-  const icons = {ok:"✅",err:"❌",warn:"⚠️",info:"ℹ️"};
-  t.innerHTML = `<span class="ic">${icons[type]||"ℹ️"}</span><span class="msg">${esc(msg)}</span><button class="x" onclick="this.parentElement.remove()">✕</button>`;
-  c.appendChild(t);
-  setTimeout(()=>{t.style.opacity="0";t.style.transform="translateX(40px)";setTimeout(()=>t.remove(),300)},dur);
-}
-function esc(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
-
-// ===== Auth =====
-function showLogin(){
-  document.getElementById("authTitle").textContent="Welcome back";
-  document.getElementById("authSub").textContent="Sign in to access your studio.";
-  document.getElementById("loginForm").style.display="block";
-  document.getElementById("registerForm").style.display="none";
-  document.getElementById("authSwitch").innerHTML=`Don't have an account? <a href="#" onclick="showRegister();return false">Create one</a>`;
-  hideAuthMsg();
-}
-function showRegister(){
-  document.getElementById("authTitle").textContent="Create your account";
-  document.getElementById("authSub").textContent="Start editing like a pro in seconds.";
-  document.getElementById("loginForm").style.display="none";
-  document.getElementById("registerForm").style.display="block";
-  document.getElementById("authSwitch").innerHTML=`Already have an account? <a href="#" onclick="showLogin();return false">Sign in</a>`;
-  hideAuthMsg();
-}
-function hideAuthMsg(){document.getElementById("authErr").classList.remove("show");document.getElementById("authOk").classList.remove("show")}
-function authErr(m){const e=document.getElementById("authErr");e.textContent=m;e.classList.add("show")}
-function authOkMsg(m){const e=document.getElementById("authOk");e.textContent=m;e.classList.add("show")}
-function togglePw(id,btn){const i=document.getElementById(id);i.type=i.type==="password"?"text":"password";btn.textContent=i.type==="password"?"👁":"🙈"}
-
-document.getElementById("loginForm").addEventListener("submit",async e=>{
-  e.preventDefault();
-  const btn=document.getElementById("loginBtn");
-  btn.disabled=true;btn.textContent="Signing in…";
-  try{
-    const r=await fetch(API+"/auth/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:document.getElementById("loginEmail").value,password:document.getElementById("loginPw").value})});
-    const d=await r.json();
-    if(!r.ok){authErr(d.error||"Login failed.");btn.disabled=false;btn.textContent="Sign In →";return}
-    TOKEN=d.token;localStorage.setItem("ps_token",TOKEN);
-    await initApp();
-  }catch(err){authErr("Network error. Please try again.");btn.disabled=false;btn.textContent="Sign In →"}
-});
-
-document.getElementById("registerForm").addEventListener("submit",async e=>{
-  e.preventDefault();
-  const btn=document.getElementById("regBtn");
-  btn.disabled=true;btn.textContent="Creating…";
-  try{
-    const r=await fetch(API+"/auth/register",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:document.getElementById("regEmail").value,password:document.getElementById("regPw").value,display_name:document.getElementById("regName").value})});
-    const d=await r.json();
-    if(!r.ok){authErr(d.error||"Registration failed.");btn.disabled=false;btn.textContent="Create Account →";return}
-    TOKEN=d.token;localStorage.setItem("ps_token",TOKEN);
-    await initApp();
-  }catch(err){authErr("Network error. Please try again.");btn.disabled=false;btn.textContent="Create Account →"}
-});
-
-async function initApp(){
-  try{
-    const r=await fetch(API+"/auth/me",{headers:authHdr()});
-    if(!r.ok){logout();return}
-    USER=await r.json();
-    showApp();
-  }catch{logout()}
-}
-function authHdr(){return{"Authorization":"Bearer "+TOKEN}}
-
-function logout(){TOKEN="";USER=null;localStorage.removeItem("ps_token");document.getElementById("appView").style.display="none";document.getElementById("authView").style.display="grid";showLogin()}
-
-function showApp(){
-  document.getElementById("authView").style.display="none";
-  document.getElementById("appView").style.display="block";
-  document.getElementById("userName").textContent=USER.display_name||USER.email;
-  document.getElementById("userEmail").textContent=USER.email;
-  document.getElementById("userAvatar").textContent=(USER.display_name||USER.email)[0].toUpperCase();
-  const isAdmin=USER.is_admin==1;
-  document.getElementById("adminNavSection").style.display=isAdmin?"block":"none";
-  ["adminUsersNav","adminActNav","adminFeatNav","adminSetNav"].forEach(id=>document.getElementById(id).style.display=isAdmin?"flex":"none");
-  loadDashboard();
-  checkMaintenance();
-}
-
-// ===== Navigation =====
-function goPage(p){
-  document.querySelectorAll(".nav-item").forEach(n=>n.classList.remove("active"));
-  const item=document.querySelector(`.nav-item[data-page="${p}"]`);
-  if(item)item.classList.add("active");
-  document.querySelectorAll(".page").forEach(pg=>pg.classList.remove("on"));
-  document.getElementById("page-"+p).classList.add("on");
-  const titles={dashboard:"Dashboard",editor:"Photo Editor",passport:"Passport Maker",myactivity:"My Activity",settings:"Account Settings","admin-users":"User Management","admin-activity":"Activity Log","admin-features":"Feature Toggles","admin-settings":"System Settings"};
-  document.getElementById("pageTitle").textContent=titles[p]||"Dashboard";
-  closeSidebar();
-  if(p==="dashboard")loadDashboard();
-  if(p==="myactivity")loadMyActivity();
-  if(p==="admin-users")loadAdminUsers();
-  if(p==="admin-activity")loadAdminActivity();
-  if(p==="admin-features")loadFeatures();
-  if(p==="admin-settings")loadSystemSettings();
-}
-document.querySelectorAll(".nav-item").forEach(n=>n.addEventListener("click",()=>goPage(n.dataset.page)));
-function openSidebar(){document.getElementById("sidebar").classList.add("open");document.getElementById("scrim").classList.add("show")}
-function closeSidebar(){document.getElementById("sidebar").classList.remove("open");document.getElementById("scrim").classList.remove("show")}
-function toggleUserMenu(){document.getElementById("userMenu").classList.toggle("show")}
-document.addEventListener("click",e=>{if(!e.target.closest("#userChip")&&!e.target.closest("#userMenu"))document.getElementById("userMenu").classList.remove("show")});
-
-// ===== Dashboard =====
-async function loadDashboard(){
-  try{
-    const r=await fetch(API+"/stats",{headers:authHdr()});
-    if(r.ok){
-      const d=await r.json();
-      document.getElementById("statEdits").textContent=d.edits||0;
-      document.getElementById("statPassports").textContent=d.passports||0;
-      document.getElementById("statExports").textContent=d.exports||0;
-      document.getElementById("statSince").textContent=d.member_since||"—";
-    }
-  }catch{}
-}
-
-// ===== Maintenance check =====
-async function checkMaintenance(){
-  try{
-    const r=await fetch(API+"/settings/public");
-    if(r.ok){
-      const d=await r.json();
-      if(d.maintenance_mode==="1"&&!USER.is_admin){
-        const banner=`<div class="maint-banner"><span>🔧</span><span>${esc(d.maintenance_message||"System under maintenance.")}</span></div>`;
-        ["dashMaintBanner","editorMaintBanner","passportMaintBanner"].forEach(id=>{const el=document.getElementById(id);if(el)el.innerHTML=banner});
-      }
-    }
-  }catch{}
-}
-
-// ===== Editor =====
-const fileInput=document.getElementById("fileInput");
-const dz=document.getElementById("dz");
-fileInput.addEventListener("change",e=>{if(e.target.files[0])loadEditorImage(e.target.files[0])});
-["dragover","dragenter"].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add("over")}));
-["dragleave","drop"].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove("over")}));
-dz.addEventListener("drop",e=>{if(e.dataTransfer.files[0])loadEditorImage(e.dataTransfer.files[0])});
-
-function loadEditorImage(file){
-  if(file.size>25*1024*1024){toast("File too large (max 25 MB).","err");return}
-  const reader=new FileReader();
-  reader.onload=async e=>{
-    showProcessing("Loading image…");
-    try{
-      const fd=new FormData();
-      fd.append("image",file);
-      const r=await fetch(API+"/editor/upload",{method:"POST",headers:authHdr(),body:fd});
-      if(!r.ok){const d=await r.json().catch(()=>({}));toast(d.error||"Upload failed.","err");hideProcessing();return}
-      const d=await r.json();
-      currentImage=d.url;
-      originalImage=d.url;
-      history=[];historyIdx=-1;
-      pushHistory("Upload");
-      await renderCanvas(d.url);
-      document.getElementById("canvasEmpty").style.display="none";
-      document.getElementById("editorCanvas").style.display="block";
-      document.getElementById("imgInfo").textContent=`${d.width} × ${d.height}px`;
-      toast("Image loaded!","ok");
-    }catch(err){toast("Failed to load image.","err")}
-    hideProcessing();
-  };
-  reader.readAsDataURL(file);
-}
-
-async function renderCanvas(url){
-  return new Promise((resolve,reject)=>{
-    const img=new Image();
-    img.onload=()=>{
-      const c=document.getElementById("editorCanvas");
-      const stage=document.getElementById("canvasStage");
-      const maxW=stage.clientWidth-40,maxH=stage.clientHeight-40;
-      let w=img.width,h=img.height;
-      const k=Math.min(maxW/w,maxH/h,1);
-      w=Math.round(w*k);h=Math.round(h*k);
-      c.width=w;c.height=h;
-      const ctx=c.getContext("2d");
-      ctx.drawImage(img,0,0,w,h);
-      resolve();
-    };
-    img.onerror=reject;
-    img.src=url;
-  });
-}
-
-function showProcessing(msg){document.getElementById("processingMsg").textContent=msg||"Processing…";document.getElementById("processingSpin").style.display="flex"}
-function hideProcessing(){document.getElementById("processingSpin").style.display="none"}
-
-// Tool tabs
-document.querySelectorAll(".tool-tab").forEach(t=>t.addEventListener("click",()=>{
-  document.querySelectorAll(".tool-tab").forEach(x=>x.classList.remove("active"));
-  document.querySelectorAll(".tool-panel").forEach(x=>x.classList.remove("on"));
-  t.classList.add("active");
-  document.getElementById("panel-"+t.dataset.tab).classList.add("on");
-  if(t.dataset.tab==="filters")renderFilters();
-}));
-
-// Adjustments
-function onAdjust(){
-  document.getElementById("vBrightness").textContent=document.getElementById("brightness").value+"%";
-  document.getElementById("vContrast").textContent=document.getElementById("contrast").value+"%";
-  document.getElementById("vExposure").textContent=document.getElementById("exposure").value;
-  document.getElementById("vSharpness").textContent=document.getElementById("sharpness").value+"%";
-  document.getElementById("vSaturation").textContent=document.getElementById("saturation").value+"%";
-  document.getElementById("vTemp").textContent=document.getElementById("temperature").value;
-  document.getElementById("vTint").textContent=document.getElementById("tint").value;
-}
-let adjustTimer=null;
-["brightness","contrast","exposure","sharpness","saturation","temperature","tint"].forEach(id=>{
-  document.getElementById(id).addEventListener("change",()=>{clearTimeout(adjustTimer);adjustTimer=setTimeout(commitAdjust,300)});
-});
-
-async function commitAdjust(){
-  if(!currentImage)return;
-  showProcessing("Applying adjustments…");
-  const ops=[
-    {op:"brightness",factor:parseFloat(document.getElementById("brightness").value)/100},
-    {op:"contrast",factor:parseFloat(document.getElementById("contrast").value)/100},
-    {op:"exposure",stops:parseFloat(document.getElementById("exposure").value)/100},
-    {op:"sharpness",factor:parseFloat(document.getElementById("sharpness").value)/100},
-    {op:"saturation",factor:parseFloat(document.getElementById("saturation").value)/100},
-    {op:"temperature",value:parseFloat(document.getElementById("temperature").value)},
-    {op:"tint",value:parseFloat(document.getElementById("tint").value)},
-  ];
-  try{
-    const r=await fetch(API+"/editor/process",{method:"POST",headers:{...authHdr(),"Content-Type":"application/json"},body:JSON.stringify({image:currentImage,ops})});
-    if(!r.ok){toast("Adjustment failed.","err");hideProcessing();return}
-    const d=await r.json();
-    currentImage=d.url;
-    pushHistory("Adjust");
-    await renderCanvas(d.url);
-  }catch{toast("Processing failed.","err")}
-  hideProcessing();
-}
-
-function applyAutoEnhance(){
-  if(!currentImage){toast("Upload an image first.","warn");return}
-  processOps([{op:"auto_enhance"}],"Auto Enhance");
-}
-
-async function processOps(ops,label){
-  if(!currentImage)return;
-  showProcessing(label+"…");
-  try{
-    const r=await fetch(API+"/editor/process",{method:"POST",headers:{...authHdr(),"Content-Type":"application/json"},body:JSON.stringify({image:currentImage,ops})});
-    if(!r.ok){toast(label+" failed.","err");hideProcessing();return}
-    const d=await r.json();
-    currentImage=d.url;
-    pushHistory(label);
-    await renderCanvas(d.url);
-    toast(label+" applied!","ok");
-  }catch{toast(label+" failed.","err")}
-  hideProcessing();
-}
-
-// Filters
-const FILTERS=["original","auto_enhance","vivid","warm","cool","vintage","sepia","bw","noir","fade","dramatic","soft_glow","matte","chrome"];
-async function renderFilters(){
-  const grid=document.getElementById("filterGrid");
-  if(grid.children.length>0)return;
-  if(!currentImage){grid.innerHTML='<div class="empty" style="grid-column:1/-1"><p style="font-size:13px">Upload an image first</p></div>';return}
-  showProcessing("Generating filter previews…");
-  try{
-    const r=await fetch(API+"/editor/filters",{method:"POST",headers:{...authHdr(),"Content-Type":"application/json"},body:JSON.stringify({image:currentImage})});
-    if(!r.ok){hideProcessing();return}
-    const d=await r.json();
-    grid.innerHTML="";
-    FILTERS.forEach(f=>{
-      const cell=document.createElement("div");
-      cell.className="filter-cell"+(f===currentFilter?" active":"");
-      cell.innerHTML=`<img src="${d.previews[f]}" alt="${f}"><div class="fn">${f.replace(/_/g," ")}</div>`;
-      cell.onclick=()=>{
-        document.querySelectorAll(".filter-cell").forEach(x=>x.classList.remove("active"));
-        cell.classList.add("active");
-        currentFilter=f;
-        processOps([{op:"filter",name:f}],"Filter: "+f);
-      };
-      grid.appendChild(cell);
-    });
-  }catch{}
-  hideProcessing();
-}
-
-// Crop / Flip / Rotate
-document.querySelectorAll("#ratioSeg button").forEach(b=>b.addEventListener("click",()=>{
-  document.querySelectorAll("#ratioSeg button").forEach(x=>x.classList.remove("active"));
-  b.classList.add("active");
-  if(!currentImage)return;
-  const r=parseFloat(b.dataset.r);
-  if(r>0)processOps([{op:"crop_ratio",ratio:r}],"Crop "+b.textContent);
-}));
-function doFlip(dir){if(currentImage)processOps([{op:"flip",direction:dir}],"Flip "+dir)}
-function doRotate(deg){if(currentImage)processOps([{op:"rotate",degrees:deg}],"Rotate "+deg+"°")}
-function doResize(){
-  if(!currentImage){toast("Upload an image first.","warn");return}
-  const w=parseInt(document.getElementById("resizeW").value),h=parseInt(document.getElementById("resizeH").value);
-  if(!w||!h||w<1||h<1){toast("Enter valid dimensions.","warn");return}
-  processOps([{op:"resize",w:w,h:h}],"Resize to "+w+"×"+h);
-}
-
-// Background
-function setBgColor(hex){document.getElementById("bgHex").value=hex}
-function applyBgReplace(){
-  if(!currentImage){toast("Upload an image first.","warn");return}
-  const hex=document.getElementById("bgHex").value.trim();
-  if(!/^#?[0-9a-fA-F]{6}$/.test(hex)){toast("Invalid HEX color.","err");return}
-  processOps([{op:"background",hex:hex.startsWith("#")?hex:"#"+hex}],"Background Replace");
-}
-function applyRemoveBg(){if(currentImage)processOps([{op:"remove_bg"}],"Remove Background")}
-
-// Export
-document.querySelectorAll("#expFmt button").forEach(b=>b.addEventListener("click",()=>{
-  document.querySelectorAll("#expFmt button").forEach(x=>x.classList.remove("active"));
-  b.classList.add("active");exportFmt=b.dataset.f;
-}));
-async function exportImage(){
-  if(!currentImage){toast("Upload an image first.","warn");return}
-  showProcessing("Exporting…");
-  try{
-    const q=parseInt(document.getElementById("expQuality").value);
-    const r=await fetch(API+"/editor/export",{method:"POST",headers:{...authHdr(),"Content-Type":"application/json"},body:JSON.stringify({image:currentImage,format:exportFmt,quality:q})});
-    if(!r.ok){toast("Export failed.","err");hideProcessing();return}
-    const blob=await r.blob();
-    const cd=r.headers.get("Content-Disposition")||"";
-    const m=cd.match(/filename="?([^";]+)"?/);
-    const name=m?m[1]:"export."+exportFmt;
-    const a=document.createElement("a");
-    a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();a.remove();
-    toast("Image exported!","ok");
-  }catch{toast("Export failed.","err")}
-  hideProcessing();
-}
-async function compressImage(){
-  if(!currentImage){toast("Upload an image first.","warn");return}
-  showProcessing("Compressing…");
-  try{
-    const r=await fetch(API+"/editor/export",{method:"POST",headers:{...authHdr(),"Content-Type":"application/json"},body:JSON.stringify({image:currentImage,format:"jpg",quality:75})});
-    if(!r.ok){toast("Compression failed.","err");hideProcessing();return}
-    const blob=await r.blob();
-    const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="compressed.jpg";document.body.appendChild(a);a.click();a.remove();
-    toast("Image compressed & downloaded!","ok");
-  }catch{toast("Compression failed.","err")}
-  hideProcessing();
-}
-
-// History
-function pushHistory(label){
-  history=history.slice(0,historyIdx+1);
-  history.push({label,url:currentImage});
-  historyIdx=history.length-1;
-  renderHistory();
-}
-function renderHistory(){
-  const list=document.getElementById("historyList");
-  if(history.length===0){list.innerHTML='<div class="empty" style="padding:24px 12px"><p style="font-size:13px">Edits will appear here</p></div>';return}
-  list.innerHTML="";
-  history.forEach((h,i)=>{
-    const item=document.createElement("div");
-    item.className="history-item"+(i===historyIdx?" current":"");
-    item.innerHTML=`<span class="ic">${i===0?"📁":"✏️"}</span><span>${esc(h.label)}</span>`;
-    item.onclick=()=>{historyIdx=i;currentImage=h.url;renderCanvas(h.url);renderHistory()};
-    list.appendChild(item);
-  });
-  document.getElementById("undoBtn").disabled=historyIdx<=0;
-  document.getElementById("redoBtn").disabled=historyIdx>=history.length-1;
-}
-function undo(){if(historyIdx>0){historyIdx--;currentImage=history[historyIdx].url;renderCanvas(currentImage);renderHistory()}}
-function redo(){if(historyIdx<history.length-1){historyIdx++;currentImage=history[historyIdx].url;renderCanvas(currentImage);renderHistory()}}
-function resetAll(){
-  if(!originalImage)return;
-  currentImage=originalImage;history=[{label:"Upload",url:originalImage}];historyIdx=0;
-  ["brightness","contrast","saturation","sharpness"].forEach(id=>document.getElementById(id).value=100);
-  ["exposure","temperature","tint","rotate"].forEach(id=>document.getElementById(id).value=0);
-  onAdjust();
-  renderCanvas(currentImage);renderHistory();
-  toast("Reset to original.","ok");
-}
-function toggleBeforeAfter(){
-  if(!originalImage||!currentImage)return;
-  showingBefore=!showingBefore;
-  document.getElementById("baBtn").textContent=showingBefore?"👁 Showing Original":"👁 Before/After";
-  renderCanvas(showingBefore?originalImage:currentImage);
-}
-
-// ===== Passport Maker =====
-const psFileInput=document.getElementById("psFileInput");
-const psDz=document.getElementById("psDz");
-let psFile=null,psUploadUrl=null;
-psFileInput.addEventListener("change",e=>{if(e.target.files[0])loadPassportImage(e.target.files[0])});
-["dragover","dragenter"].forEach(ev=>psDz.addEventListener(ev,e=>{e.preventDefault();psDz.classList.add("over")}));
-psDz.addEventListener("drop",e=>{e.preventDefault();psDz.classList.remove("over");if(e.dataTransfer.files[0])loadPassportImage(e.dataTransfer.files[0])});
-
-async function loadPassportImage(file){
-  if(file.size>25*1024*1024){toast("File too large.","err");return}
-  showProcessing("Uploading…");
-  try{
-    const fd=new FormData();fd.append("image",file);
-    const r=await fetch(API+"/editor/upload",{method:"POST",headers:authHdr(),body:fd});
-    if(!r.ok){toast("Upload failed.","err");hideProcessing();return}
-    const d=await r.json();
-    psUploadUrl=d.url;psFile=file;
-    document.getElementById("psPreview").src=d.url;
-    document.getElementById("psForm").style.display="block";
-    document.getElementById("psDz").style.display="none";
-  }catch{toast("Upload failed.","err")}
-  hideProcessing();
-}
-document.getElementById("psPage").addEventListener("change",e=>{document.getElementById("psCustomPage").style.display=e.target.value==="custom"?"grid":"none"});
-document.getElementById("psPhoto").addEventListener("change",e=>{document.getElementById("psCustomPhoto").style.display=e.target.value==="custom"?"grid":"none"});
-document.getElementById("psBg").addEventListener("change",e=>{document.getElementById("psBgHex").style.display=e.target.value==="custom"?"block":"none"});
-
-async function generatePassport(){
-  if(!psUploadUrl){toast("Upload a photo first.","warn");return}
-  const btn=document.getElementById("psGenBtn");
-  btn.disabled=true;btn.textContent="⏳ Generating…";
-  try{
-    const payload={
-      image:psUploadUrl,
-      page:document.getElementById("psPage").value,
-      page_w:parseFloat(document.getElementById("psPW").value)||null,
-      page_h:parseFloat(document.getElementById("psPH").value)||null,
-      ps:document.getElementById("psPhoto").value,
-      ps_w:parseFloat(document.getElementById("psPhW").value)||null,
-      ps_h:parseFloat(document.getElementById("psPhH").value)||null,
-      bg:document.getElementById("psBg").value,
-      hex:document.getElementById("psHex").value,
-      qty:parseInt(document.getElementById("psQty").value)||8,
-      fmt:document.getElementById("psFmt").value,
-    };
-    const r=await fetch(API+"/passport/generate",{method:"POST",headers:{...authHdr(),"Content-Type":"application/json"},body:JSON.stringify(payload)});
-    if(!r.ok){const d=await r.json().catch(()=>({}));toast(d.error||"Generation failed.","err");btn.disabled=false;btn.textContent="🖨 Generate Print Sheet";return}
-    const blob=await r.blob();
-    const cd=r.headers.get("Content-Disposition")||"";
-    const m=cd.match(/filename="?([^";]+)"?/);
-    const name=m?m[1]:(payload.fmt==="pdf"?"passport.pdf":"passport.zip");
-    const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();a.remove();
-    document.getElementById("psResult").innerHTML=`<div class="badge ok" style="margin-top:14px">✅ Downloaded: ${esc(name)}</div>`;
-    toast("Print sheet generated!","ok");
-  }catch{toast("Generation failed.","err")}
-  btn.disabled=false;btn.textContent="🖨 Generate Print Sheet";
-}
-function startPassportEditor(){goPage("passport")}
-
-// ===== My Activity =====
-async function loadMyActivity(){
-  try{
-    const r=await fetch(API+"/my/activity",{headers:authHdr()});
-    if(!r.ok)return;
-    const d=await r.json();
-    const body=document.getElementById("myActBody");
-    if(d.length===0){body.innerHTML='<tr><td colspan="3" class="empty">No activity yet.</td></tr>';return}
-    body.innerHTML=d.map(a=>`<tr><td>${esc(a.action)}</td><td>${a.file_count||0}</td><td>${timeAgo(a.timestamp)}</td></tr>`).join("");
-  }catch{}
-}
-
-// ===== Settings =====
-async function loadSettings(){
-  if(USER){document.getElementById("setName").value=USER.display_name||"";document.getElementById("setEmail").value=USER.email||""}
-}
-async function saveSettings(){
-  try{
-    const r=await fetch(API+"/account/update",{method:"POST",headers:{...authHdr(),"Content-Type":"application/json"},body:JSON.stringify({display_name:document.getElementById("setName").value})});
-    if(r.ok){toast("Settings saved.","ok");USER.display_name=document.getElementById("setName").value;document.getElementById("userName").textContent=USER.display_name||USER.email;document.getElementById("userAvatar").textContent=(USER.display_name||USER.email)[0].toUpperCase()}
-    else{const d=await r.json().catch(()=>({}));toast(d.error||"Failed to save.","err")}
-  }catch{toast("Network error.","err")}
-}
-async function changePassword(){
-  const cur=document.getElementById("setCurPw").value,nw=document.getElementById("setNewPw").value,cf=document.getElementById("setConfPw").value;
-  if(!cur||!nw){toast("Fill in all password fields.","warn");return}
-  if(nw.length<8){toast("Password must be at least 8 characters.","warn");return}
-  if(nw!==cf){toast("Passwords don't match.","err");return}
-  try{
-    const r=await fetch(API+"/account/password",{method:"POST",headers:{...authHdr(),"Content-Type":"application/json"},body:JSON.stringify({current_password:cur,new_password:nw})});
-    if(r.ok){toast("Password updated.","ok");document.getElementById("setCurPw").value="";document.getElementById("setNewPw").value="";document.getElementById("setConfPw").value=""}
-    else{const d=await r.json().catch(()=>({}));toast(d.error||"Failed to update.","err")}
-  }catch{toast("Network error.","err")}
-}
-
-// ===== Admin =====
-async function loadAdminUsers(){
-  try{
-    const r=await fetch(API+"/admin/users",{headers:authHdr()});
-    if(!r.ok)return;
-    const d=await r.json();
-    document.getElementById("admTotalUsers").textContent=d.users.length;
-    document.getElementById("admActiveUsers").textContent=d.users.filter(u=>u.is_active&&!u.is_banned).length;
-    document.getElementById("admBannedUsers").textContent=d.users.filter(u=>u.is_banned).length;
-    document.getElementById("admSessions").textContent=d.active_sessions;
-    const body=document.getElementById("admUsersBody");
-    body.innerHTML=d.users.map(u=>`<tr>
-      <td><div style="font-weight:600">${esc(u.display_name||u.email)}</div><div style="font-size:12px;color:var(--mut)">${esc(u.email)}</div>${u.is_admin?'<span class="badge admin" style="margin-top:4px">ADMIN</span>':''}</td>
-      <td>${new Date(u.created_at*1000).toLocaleDateString()}</td>
-      <td>${u.last_login?timeAgo(u.last_login):"—"}</td>
-      <td>${u.is_banned?'<span class="badge bad">Banned</span>':u.is_active?'<span class="badge ok">Active</span>':'<span class="badge mut">Inactive</span>'}</td>
-      <td>${u.has_bot_access?'<span class="badge ok">✓ Granted</span>':'<span class="badge bad">✕ Revoked</span>'}</td>
-      <td><div class="row-act">
-        <button onclick="toggleBotAccess(${u.id})" class="${u.has_bot_access?'danger':'ok-btn'}">${u.has_bot_access?'Revoke':'Grant'}</button>
-        <button onclick="toggleBan(${u.id})" class="${u.is_banned?'ok-btn':'danger'}">${u.is_banned?'Unban':'Ban'}</button>
-        <button onclick="toggleAdmin(${u.id})" class="${u.is_admin?'danger':''}">${u.is_admin?'Remove Admin':'Make Admin'}</button>
-      </div></td>
-    </tr>`).join("");
-  }catch{}
-}
-async function toggleBotAccess(uid){
-  const r=await fetch(API+"/admin/toggle-bot",{method:"POST",headers:{...authHdr(),"Content-Type":"application/json"},body:JSON.stringify({user_id:uid})});
-  if(r.ok){toast("Bot access updated.","ok");loadAdminUsers()}else toast("Failed.","err")
-}
-async function toggleBan(uid){
-  const reason=prompt("Reason for ban/unban (optional):")||"";
-  const r=await fetch(API+"/admin/toggle-ban",{method:"POST",headers:{...authHdr(),"Content-Type":"application/json"},body:JSON.stringify({user_id:uid,reason})});
-  if(r.ok){toast("Ban status updated.","ok");loadAdminUsers()}else toast("Failed.","err")
-}
-async function toggleAdmin(uid){
-  if(!confirm("Change admin status for this user?"))return;
-  const r=await fetch(API+"/admin/toggle-admin",{method:"POST",headers:{...authHdr(),"Content-Type":"application/json"},body:JSON.stringify({user_id:uid})});
-  if(r.ok){toast("Admin status updated.","ok");loadAdminUsers()}else toast("Failed.","err")
-}
-async function loadAdminActivity(){
-  try{
-    const r=await fetch(API+"/admin/activity",{headers:authHdr()});
-    if(!r.ok)return;
-    const d=await r.json();
-    const body=document.getElementById("admActBody");
-    if(d.length===0){body.innerHTML='<tr><td colspan="5" class="empty">No activity logged.</td></tr>';return}
-    body.innerHTML=d.map(a=>`<tr><td>${esc(a.email||"—")}</td><td>${esc(a.action)}</td><td style="font-size:13px">${esc(a.details||"")}</td><td style="font-size:12px">${esc(a.ip_address||"")}</td><td>${timeAgo(a.timestamp)}</td></tr>`).join("");
-  }catch{}
-}
-async function loadFeatures(){
-  try{
-    const r=await fetch(API+"/admin/features",{headers:authHdr()});
-    if(!r.ok)return;
-    const d=await r.json();
-    const list=document.getElementById("featList");
-    const labels={
-      feature_passport_maker:"Passport Photo Maker",feature_photo_editor:"Photo Editor",
-      feature_background_removal:"Background Removal",feature_filters:"Filters & Presets",
-      feature_pdf_export:"PDF Export",feature_custom_dimensions:"Custom Dimensions",
-      feature_batch_printing:"Batch Printing"};
-    list.innerHTML=Object.entries(d).map(([k,v])=>{
-      const lbl=labels[k]||k;const on=v==="1";
-      return `<div style="display:flex;align-items:center;justify-content:space-between;padding:14px 0;border-bottom:1px solid var(--line)"><div><div style="font-weight:600;font-size:14px">${lbl}</div><div style="font-size:12px;color:var(--mut)">${k}</div></div><label class="toggle"><input type="checkbox" data-k="${k}" ${on?"checked":""}><span class="track"></span><span class="thumb"></span></label></div>`;
-    }).join("");
-  }catch{}
-}
-async function saveFeatures(){
-  const feats={};
-  document.querySelectorAll("#featList input[type=checkbox]").forEach(c=>feats[c.dataset.k]=c.checked?"1":"0");
-  try{
-    const r=await fetch(API+"/admin/features",{method:"PUT",headers:{...authHdr(),"Content-Type":"application/json"},body:JSON.stringify(feats)});
-    if(r.ok)toast("Features saved.","ok");else toast("Failed.","err");
-  }catch{toast("Network error.","err")}
-}
-async function loadSystemSettings(){
-  try{
-    const r=await fetch(API+"/admin/settings",{headers:authHdr()});
-    if(!r.ok)return;
-    const d=await r.json();
-    document.getElementById("setSiteName").value=d.site_name||"";
-    document.getElementById("setMaxUpload").value=d.max_upload_mb||25;
-    document.getElementById("setRegOpen").checked=d.registration_open==="1";
-    document.getElementById("setMaint").checked=d.maintenance_mode==="1";
-    document.getElementById("setMaintMsg").value=d.maintenance_message||"";
-  }catch{}
-}
-async function saveSystemSettings(){
-  const data={
-    site_name:document.getElementById("setSiteName").value,
-    max_upload_mb:document.getElementById("setMaxUpload").value,
-    registration_open:document.getElementById("setRegOpen").checked?"1":"0",
-    maintenance_mode:document.getElementById("setMaint").checked?"1":"0",
-    maintenance_message:document.getElementById("setMaintMsg").value,
-  };
-  try{
-    const r=await fetch(API+"/admin/settings",{method:"PUT",headers:{...authHdr(),"Content-Type":"application/json"},body:JSON.stringify(data)});
-    if(r.ok){toast("System settings saved.","ok");checkMaintenance()}else toast("Failed.","err");
-  }catch{toast("Network error.","err")}
-}
-
-// ===== Modal =====
-function showModal(html){document.getElementById("modalBox").innerHTML=html;document.getElementById("modalBg").classList.add("show")}
-function closeModal(){document.getElementById("modalBg").classList.remove("show")}
-
-// ===== Utils =====
-function timeAgo(ts){
-  if(!ts)return "—";
-  const d=Date.now()/1000-ts;
-  if(d<60)return "just now";
-  if(d<3600)return Math.floor(d/60)+"m ago";
-  if(d<86400)return Math.floor(d/3600)+"h ago";
-  if(d<604800)return Math.floor(d/86400)+"d ago";
-  return new Date(ts*1000).toLocaleDateString();
-}
-
-// ===== Init =====
-if(TOKEN)initApp();
-</script>
-</body>
-</html>
-"""
 
 
 # --------------------------------------------------------------------------- #
-# Web server middleware & helpers
+# Premium web application: authentication, admin controls, photo editor
 # --------------------------------------------------------------------------- #
 
-def _client_ip(request: web.Request) -> str:
-    fwd = request.headers.get("X-Forwarded-For", "")
-    if fwd:
-        return fwd.split(",")[0].strip()[:100]
-    return request.remote or ""
+DB_PATH = Path(os.getenv("DATABASE_PATH", str(Path(tempfile.gettempdir()) / "photo_maker.sqlite3")))
+SESSION_DAYS = int(os.getenv("SESSION_DAYS", "7"))
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "").strip().lower()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+SECURE_COOKIES = os.getenv("SECURE_COOKIES", "1").strip().lower() not in ("0", "false", "no")
+MAX_EXPORT_BYTES = 50 * 1024 * 1024
 
+FEATURE_DEFAULTS = {
+    "editor": True, "passport": True, "background": True, "pdf": True,
+    "a4_print": True, "enhance": True, "compression": True,
+}
 
-def _get_session_user(request: web.Request):
-    """Return user row for the Bearer token in the request, or None."""
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return None
-    token = auth[7:].strip()
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+def hash_password(password: str, salt: bytes | None = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2**14, r=8, p=1, dklen=32)
+    return "scrypt$" + base64.urlsafe_b64encode(salt).decode() + "$" + base64.urlsafe_b64encode(digest).decode()
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        _, s, d = stored.split("$", 2)
+        salt = base64.urlsafe_b64decode(s.encode())
+        expected = base64.urlsafe_b64decode(d.encode())
+        actual = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2**14, r=8, p=1, dklen=32)
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+def valid_email(email: str) -> bool:
+    email = email.strip().lower()
+    if len(email) > 254 or " " in email or email.count("@") != 1:
+        return False
+    local, domain = email.rsplit("@", 1)
+    return bool(local and "." in domain and len(domain) >= 3)
+
+def init_db():
+    conn = db()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'user',
+        bot_access INTEGER NOT NULL DEFAULT 0,
+        banned INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        last_login TEXT,
+        usage_count INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS sessions(
+        token_hash TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        csrf TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS activity(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        email TEXT,
+        action TEXT NOT NULL,
+        meta TEXT,
+        ip TEXT,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS settings(
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+    """)
+    for k, v in FEATURE_DEFAULTS.items():
+        conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (f"feature:{k}", "1" if v else "0"))
+    conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('maintenance','0')")
+    conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('maintenance_message','We are performing a short maintenance update. Please try again soon.')")
+    conn.commit()
+    if ADMIN_EMAIL and ADMIN_PASSWORD:
+        row = conn.execute("SELECT id FROM users WHERE email=?", (ADMIN_EMAIL,)).fetchone()
+        now = datetime.now(timezone.utc).isoformat()
+        if row:
+            conn.execute("UPDATE users SET role='admin', password_hash=? WHERE id=?",
+                         (hash_password(ADMIN_PASSWORD), row["id"]))
+        else:
+            conn.execute("""INSERT INTO users(email,password_hash,role,bot_access,created_at)
+                            VALUES(?,?,?,?,?)""",
+                         (ADMIN_EMAIL, hash_password(ADMIN_PASSWORD), "admin", 1, now))
+        conn.commit()
+    conn.close()
+
+init_db()
+
+def setting(key, default=None):
+    conn = db()
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return (row["value"] if row else default)
+
+def set_setting(key, value):
+    conn = db()
+    conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                 (key, str(value)))
+    conn.commit()
+    conn.close()
+
+def log_activity(user_id, email, action, meta="", ip=""):
+    conn = db()
+    conn.execute("INSERT INTO activity(user_id,email,action,meta,ip,created_at) VALUES(?,?,?,?,?,?)",
+                 (user_id, email, action, meta[:1000], ip[:120], datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    conn.close()
+
+def create_session(user_id, ip):
+    raw = secrets.token_urlsafe(48)
+    token_hash = hashlib.sha256(raw.encode()).hexdigest()
+    csrf = secrets.token_urlsafe(24)
+    now = datetime.now(timezone.utc)
+    exp = now.timestamp() + SESSION_DAYS * 86400
+    expires = datetime.fromtimestamp(exp, timezone.utc).isoformat()
+    conn = db()
+    conn.execute("INSERT INTO sessions(token_hash,user_id,csrf,created_at,expires_at) VALUES(?,?,?,?,?)",
+                 (token_hash, user_id, csrf, now.isoformat(), expires))
+    conn.commit()
+    conn.close()
+    return raw, csrf
+
+def current_user(request):
+    token = request.cookies.get("session")
     if not token:
         return None
-    sess = db_get_session(token)
-    if sess is None:
+    th = hashlib.sha256(token.encode()).hexdigest()
+    conn = db()
+    row = conn.execute("""SELECT u.*,s.csrf,s.expires_at FROM sessions s
+                          JOIN users u ON u.id=s.user_id WHERE s.token_hash=?""", (th,)).fetchone()
+    if not row:
+        conn.close(); return None
+    try:
+        expired = datetime.fromisoformat(row["expires_at"]) < datetime.now(timezone.utc)
+    except Exception:
+        expired = True
+    if expired or row["banned"]:
+        conn.execute("DELETE FROM sessions WHERE token_hash=?", (th,))
+        conn.commit(); conn.close()
         return None
-    user = db_get_user_by_id(sess["user_id"])
-    return user
+    conn.close()
+    return row
 
+def csrf_ok(request, user):
+    return user is not None and request.headers.get("X-CSRF-Token", "") == user["csrf"]
 
-def _require_user(request: web.Request):
-    user = _get_session_user(request)
-    if user is None:
-        return None, web.json_response({"error": "Not authenticated."}, status=401)
-    if user["is_banned"]:
-        return None, web.json_response({"error": "Your account has been banned."}, status=403)
-    return user, None
+def json_error(message, status=400):
+    return web.json_response({"ok": False, "error": message}, status=status)
 
+def require_user(request):
+    u = current_user(request)
+    if not u:
+        return None, json_error("Please login to continue.", 401)
+    if str(setting("maintenance", "0")) == "1" and u["role"] != "admin":
+        return None, json_error(setting("maintenance_message", "Maintenance in progress."), 503)
+    return u, None
 
-def _require_admin(request: web.Request):
-    user, err = _require_user(request)
-    if err is not None:
+def require_admin(request):
+    u, err = require_user(request)
+    if err:
         return None, err
-    if not user["is_admin"]:
-        return None, web.json_response({"error": "Admin access required."}, status=403)
-    return user, None
+    if u["role"] != "admin":
+        return None, json_error("Admin access required.", 403)
+    return u, None
 
-
-def _require_feature(key: str):
-    """Return a decorator-style check; used inline below."""
-
-    def check():
-        return db_get_setting(key, "1") == "1"
-
-    return check
-
-
-def _json_error(msg: str, status: int = 400) -> web.Response:
-    return web.json_response({"error": msg}, status=status)
-
-
-def _user_dict(u) -> dict:
-    return {
-        "id": u["id"],
-        "email": u["email"],
-        "display_name": u["display_name"] or "",
-        "is_admin": u["is_admin"],
-        "is_active": u["is_active"],
-        "has_bot_access": u["has_bot_access"],
-        "is_banned": u["is_banned"],
-        "created_at": u["created_at"],
-        "last_login": u["last_login"],
-    }
-
-
-def _store_uploaded_image(data: bytes, uid: int) -> str:
-    """Save an uploaded image under a per-user session directory and return a
-    relative token used to refer back to it via /api/editor/image/<token>."""
-    # Validate
-    load_image(data).close()
-    d = user_dir(f"web_{uid}")
-    token = secrets.token_urlsafe(16)
-    # Detect format from content
-    ext = "jpg"
+async def read_json(request):
     try:
-        with Image.open(io.BytesIO(data)) as im:
-            fmt = (im.format or "").lower()
-            if fmt in ("png", "webp", "bmp", "tiff"):
-                ext = fmt
+        return await request.json()
     except Exception:
-        pass
-    path = d / f"{token}.{ext}"
-    path.write_bytes(data)
-    return token
+        return None
 
+async def http_index(request):
+    return web.Response(text=PREMIUM_HTML, content_type="text/html", charset="utf-8",
+                        headers={"Cache-Control": "no-store"})
 
-def _resolve_image_token(token: str, uid: int) -> Path:
-    """Resolve a token back to a file path; verify ownership."""
-    if not token or "/" in token or ".." in token:
-        raise ValueError("Invalid image token.")
-    d = user_dir(f"web_{uid}")
-    # Find a file matching the token prefix
-    for p in d.iterdir():
-        if p.is_file() and p.name.startswith(token):
-            try:
-                p.resolve().relative_to(TMP_ROOT.resolve())
-            except ValueError:
-                continue
-            return p
-    raise ValueError("Image not found.")
+async def http_auth_me(request):
+    u = current_user(request)
+    if not u:
+        return web.json_response({"authenticated": False})
+    return web.json_response({"authenticated": True, "csrf": u["csrf"],
+                              "user": {"id":u["id"],"email":u["email"],"role":u["role"],
+                                       "bot_access":bool(u["bot_access"]), "usage_count":u["usage_count"]},
+                              "maintenance": setting("maintenance","0") == "1"})
 
-
-# In-memory index of editor preview URLs -> (uid, token)
-# Used so /api/editor/process can accept the preview URL or a raw token.
-def _url_to_token(url: str) -> str:
-    if not url:
-        return ""
-    if url.startswith("/api/editor/image/"):
-        return url.rsplit("/", 1)[-1]
-    # fallback: assume it's already a token
-    return url
-
-
-# --------------------------------------------------------------------------- #
-# Auth endpoints
-# --------------------------------------------------------------------------- #
-
-async def http_auth_register(request: web.Request) -> web.Response:
-    try:
-        body = await request.json()
-    except Exception:
-        return _json_error("Invalid request body.", 400)
-    email = (body.get("email") or "").strip().lower()
-    password = (body.get("password") or "").strip()
-    display_name = (body.get("display_name") or "").strip()[:80]
-    if not EMAIL_RE.match(email or ""):
-        return _json_error("Please enter a valid email address.", 400)
+async def http_register(request):
+    if setting("maintenance","0") == "1":
+        return json_error(setting("maintenance_message"), 503)
+    data = await read_json(request)
+    if not isinstance(data, dict):
+        return json_error("Invalid request.")
+    email = str(data.get("email","")).strip().lower()
+    password = str(data.get("password",""))
+    if not valid_email(email):
+        return json_error("Enter a valid email address.")
     if len(password) < 8:
-        return _json_error("Password must be at least 8 characters.", 400)
-    if db_get_setting("registration_open", "1") != "1":
-        return _json_error("Registration is currently closed.", 403)
-    uid = db_create_user(email, password, display_name)
-    if uid is None:
-        return _json_error("An account with this email already exists.", 409)
-    db_log_activity(uid, "register", ip=_client_ip(request))
-    token = db_create_session(uid, _client_ip(request), request.headers.get("User-Agent", ""))
-    user = db_get_user_by_id(uid)
-    return web.json_response({"token": token, "user": _user_dict(user)})
-
-
-async def http_auth_login(request: web.Request) -> web.Response:
+        return json_error("Password must be at least 8 characters.")
+    conn = db()
     try:
-        body = await request.json()
-    except Exception:
-        return _json_error("Invalid request body.", 400)
-    email = (body.get("email") or "").strip().lower()
-    password = (body.get("password") or "").strip()
-    user = db_get_user_by_email(email)
-    if user is None or not _verify_password(password, user["password_salt"], user["password_hash"]):
-        return _json_error("Invalid email or password.", 401)
-    if user["is_banned"]:
-        return _json_error("Your account has been banned. Contact support.", 403)
-    token = db_create_session(user["id"], _client_ip(request), request.headers.get("User-Agent", ""))
-    db_log_activity(user["id"], "login", ip=_client_ip(request))
-    return web.json_response({"token": token, "user": _user_dict(user)})
-
-
-async def http_auth_me(request: web.Request) -> web.Response:
-    user, err = _require_user(request)
-    if err is not None:
-        return err
-    return web.json_response(_user_dict(user))
-
-
-async def http_auth_logout(request: web.Request) -> web.Response:
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        db_delete_session(auth[7:].strip())
-    return web.json_response({"ok": True})
-
-
-# --------------------------------------------------------------------------- #
-# Account endpoints
-# --------------------------------------------------------------------------- #
-
-async def http_account_update(request: web.Request) -> web.Response:
-    user, err = _require_user(request)
-    if err is not None:
-        return err
-    try:
-        body = await request.json()
-    except Exception:
-        return _json_error("Invalid request body.", 400)
-    name = (body.get("display_name") or "").strip()[:80]
-    db_update_user(user["id"], display_name=name)
-    db_log_activity(user["id"], "update_profile", ip=_client_ip(request))
-    return web.json_response({"ok": True, "user": _user_dict(db_get_user_by_id(user["id"]))})
-
-
-async def http_account_password(request: web.Request) -> web.Response:
-    user, err = _require_user(request)
-    if err is not None:
-        return err
-    try:
-        body = await request.json()
-    except Exception:
-        return _json_error("Invalid request body.", 400)
-    cur = body.get("current_password") or ""
-    new = body.get("new_password") or ""
-    if not _verify_password(cur, user["password_salt"], user["password_hash"]):
-        return _json_error("Current password is incorrect.", 400)
-    if len(new) < 8:
-        return _json_error("New password must be at least 8 characters.", 400)
-    salt = secrets.token_hex(16)
-    phash = _hash_password(new, salt)
-    conn = _db()
-    try:
-        conn.execute("UPDATE users SET password_hash=?, password_salt=? WHERE id=?",
-                     (phash, salt, user["id"]))
+        now = datetime.now(timezone.utc).isoformat()
+        cur = conn.execute("""INSERT INTO users(email,password_hash,role,created_at)
+                              VALUES(?,?,?,?,?)""",
+                           (email,hash_password(password),"user",now))
+        uid = cur.lastrowid
         conn.commit()
-    finally:
+    except sqlite3.IntegrityError:
         conn.close()
-    db_log_activity(user["id"], "change_password", ip=_client_ip(request))
-    return web.json_response({"ok": True})
+        return json_error("An account with this email already exists.", 409)
+    conn.close()
+    token, csrf = create_session(uid, request.remote or "")
+    log_activity(uid,email,"register","",request.remote or "")
+    resp = web.json_response({"ok":True,"user":{"email":email,"role":"user"},"csrf":csrf})
+    resp.set_cookie("session",token,max_age=SESSION_DAYS*86400,httponly=True,samesite="Lax",
+                    secure=SECURE_COOKIES,path="/")
+    return resp
 
-
-async def http_my_activity(request: web.Request) -> web.Response:
-    user, err = _require_user(request)
-    if err is not None:
-        return err
-    conn = _db()
-    try:
-        rows = conn.execute(
-            "SELECT action, file_count, timestamp FROM usage_stats WHERE user_id=? "
-            "ORDER BY timestamp DESC LIMIT 100", (user["id"],)).fetchall()
-    finally:
+async def http_login(request):
+    if setting("maintenance","0") == "1":
+        return json_error(setting("maintenance_message"), 503)
+    data = await read_json(request)
+    email = str(data.get("email","")).strip().lower() if isinstance(data,dict) else ""
+    password = str(data.get("password","")) if isinstance(data,dict) else ""
+    conn = db()
+    row = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+    if not row or not verify_password(password,row["password_hash"]):
         conn.close()
-    return web.json_response([dict(r) for r in rows])
-
-
-async def http_stats(request: web.Request) -> web.Response:
-    user, err = _require_user(request)
-    if err is not None:
-        return err
-    conn = _db()
-    try:
-        rows = conn.execute(
-            "SELECT action, COUNT(*) as c FROM usage_stats WHERE user_id=? GROUP BY action",
-            (user["id"],)).fetchall()
-    finally:
+        return json_error("Invalid email or password.", 401)
+    if row["banned"]:
         conn.close()
-    counts = {r["action"]: r["c"] for r in rows}
-    return web.json_response({
-        "edits": counts.get("editor", 0),
-        "passports": counts.get("passport", 0),
-        "exports": counts.get("export", 0),
-        "member_since": datetime.fromtimestamp(user["created_at"]).strftime("%b %Y"),
-    })
+        return json_error("This account has been banned.", 403)
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE users SET last_login=? WHERE id=?", (now,row["id"]))
+    conn.commit(); conn.close()
+    token, csrf = create_session(row["id"],request.remote or "")
+    log_activity(row["id"],email,"login","",request.remote or "")
+    resp = web.json_response({"ok":True,"csrf":csrf})
+    resp.set_cookie("session",token,max_age=SESSION_DAYS*86400,httponly=True,samesite="Lax",
+                    secure=SECURE_COOKIES,path="/")
+    return resp
 
+async def http_logout(request):
+    u = current_user(request)
+    if u:
+        token = request.cookies.get("session")
+        conn=db(); conn.execute("DELETE FROM sessions WHERE token_hash=?",
+                                (hashlib.sha256(token.encode()).hexdigest(),)); conn.commit(); conn.close()
+        log_activity(u["id"],u["email"],"logout","",request.remote or "")
+    resp=web.json_response({"ok":True})
+    resp.del_cookie("session",path="/")
+    return resp
 
-# --------------------------------------------------------------------------- #
-# Public settings
-# --------------------------------------------------------------------------- #
+def process_adjustments(img, a):
+    img = img.convert("RGB")
+    arr = np.asarray(img).astype(np.float32) / 255.0
+    brightness = float(a.get("brightness",0))
+    contrast = float(a.get("contrast",0))
+    exposure = float(a.get("exposure",0))
+    saturation = float(a.get("saturation",0))
+    warmth = float(a.get("warmth",0))
+    tint = float(a.get("tint",0))
+    if exposure:
+        arr *= 2.0 ** (exposure / 100.0)
+    if brightness:
+        arr += brightness / 100.0
+    if contrast:
+        factor = (259.0*(contrast+255.0))/(255.0*(259.0-contrast))
+        arr = (arr-0.5)*factor + 0.5
+    if saturation:
+        lum = arr[...,0]*0.2126 + arr[...,1]*0.7152 + arr[...,2]*0.0722
+        arr = lum[...,None] + (arr-lum[...,None])*(1+saturation/100.0)
+    if warmth:
+        arr[...,0] += warmth/300.0
+        arr[...,2] -= warmth/300.0
+    if tint:
+        arr[...,1] += tint/350.0
+        arr[...,0] += tint/500.0
+    arr=np.clip(arr,0,1)
+    out=Image.fromarray((arr*255+0.5).astype(np.uint8),"RGB")
+    sharp=float(a.get("sharpness",0))
+    if sharp > 0:
+        out=out.filter(ImageFilter.UnsharpMask(radius=1.2,percent=int(min(250,sharp*2.2)),threshold=3))
+    denoise=float(a.get("denoise",0))
+    if denoise > 0:
+        out=out.filter(ImageFilter.MedianFilter(size=3))
+    return out
 
-async def http_settings_public(request: web.Request) -> web.Response:
-    return web.json_response({
-        "maintenance_mode": db_get_setting("maintenance_mode", "0"),
-        "maintenance_message": db_get_setting("maintenance_message", ""),
-        "site_name": db_get_setting("site_name", "Photo Studio Pro"),
-        "registration_open": db_get_setting("registration_open", "1"),
-    })
-
-
-# --------------------------------------------------------------------------- #
-# Editor endpoints
-# --------------------------------------------------------------------------- #
-
-async def http_editor_upload(request: web.Request) -> web.Response:
-    user, err = _require_user(request)
-    if err is not None:
-        return err
-    if db_get_setting("feature_photo_editor", "1") != "1":
-        return _json_error("Photo editor is currently disabled.", 403)
+def apply_crop(img, crop):
+    if not isinstance(crop,dict): return img
     try:
-        reader = await request.multipart()
-        data = None
+        x=max(0,int(float(crop.get("x",0))))
+        y=max(0,int(float(crop.get("y",0))))
+        w=max(1,int(float(crop.get("w",img.width))))
+        h=max(1,int(float(crop.get("h",img.height))))
+        x=min(x,img.width-1); y=min(y,img.height-1)
+        w=min(w,img.width-x); h=min(h,img.height-y)
+        return img.crop((x,y,x+w,y+h))
+    except Exception:
+        return img
+
+def apply_editor_ops(img, payload):
+    img=ImageOps.exif_transpose(img).convert("RGB")
+    img=apply_crop(img,payload.get("crop"))
+    rot=int(payload.get("rotation",0)) % 360
+    if rot in (90,180,270):
+        img=img.rotate(-rot,expand=True,resample=Image.Resampling.BICUBIC)
+    if payload.get("flip_h"): img=ImageOps.mirror(img)
+    if payload.get("flip_v"): img=ImageOps.flip(img)
+    img=process_adjustments(img,payload.get("adjustments",{}))
+    bg=payload.get("background")
+    if isinstance(bg,dict) and bg.get("mode")=="solid":
+        rgb=parse_hex_color(str(bg.get("color","#FFFFFF")))
+        if rgb:
+            img,_=replace_background(img,rgb)
+    return img
+
+def export_image(img, fmt, quality=95, dpi=300):
+    b=io.BytesIO()
+    fmt=fmt.lower()
+    if fmt in ("jpg","jpeg"):
+        img.save(b,"JPEG",quality=max(40,min(100,int(quality))),subsampling=0,optimize=True,dpi=(dpi,dpi))
+        return b.getvalue(),"image/jpeg","edited.jpg"
+    if fmt=="png":
+        img.save(b,"PNG",optimize=True,dpi=(dpi,dpi))
+        return b.getvalue(),"image/png","edited.png"
+    raise ValueError("Unsupported image format.")
+
+def build_print_pdf(img, page_w_mm, page_h_mm, pw_mm, ph_mm, qty, quality=95):
+    sheet=build_sheet(img,page_w_mm,page_h_mm,pw_mm,ph_mm,qty)
+    b=io.BytesIO()
+    sheet.save(b,"PDF",resolution=float(DPI))
+    return b.getvalue(),"application/pdf","photo-sheet.pdf"
+
+async def http_editor_process(request):
+    u, err = require_user(request)
+    if err: return err
+    if not csrf_ok(request,u): return json_error("Security token expired. Refresh and try again.",403)
+    if setting("feature:editor","1")!="1": return json_error("The editor is currently disabled.",503)
+    try:
+        reader=await request.multipart()
+        photo=None; payload={}
         async for part in reader:
-            if part.name == "image":
-                data = await part.read(decode=False)
-                break
-        if not data:
-            return _json_error("No image provided.", 400)
-        if len(data) > MAX_IMAGE_BYTES:
-            return _json_error("File too large (max 25 MB).", 400)
-        try:
-            img = load_image(data)
-            w, h = img.size
-            img.close()
-        except ValueError as exc:
-            return _json_error(str(exc), 400)
-        except Exception:
-            return _json_error("Invalid image file.", 400)
-        token = _store_uploaded_image(data, user["id"])
-        db_log_usage(user["id"], "editor")
-        return web.json_response({
-            "url": f"/api/editor/image/{token}",
-            "width": w,
-            "height": h,
+            if part.name=="photo":
+                photo=await part.read(decode=False)
+            elif part.name=="payload":
+                try: payload=json.loads((await part.read(decode=False)).decode())
+                except Exception: payload={}
+        if not photo: return json_error("No image was uploaded.")
+        img=load_image(photo)
+        out=apply_editor_ops(img,payload)
+        mode=str(payload.get("export","jpg")).lower()
+        quality=int(payload.get("quality",95))
+        dpi=int(payload.get("dpi",300))
+        if mode=="pdf":
+            page=payload.get("page",{})
+            ps=payload.get("photo_size",{})
+            pdf,ct,name=build_print_pdf(out,float(page.get("w",210)),float(page.get("h",297)),
+                                        float(ps.get("w",35)),float(ps.get("h",45)),
+                                        max(1,min(MAX_QTY,int(payload.get("qty",1)))))
+            blob,ct,name=pdf,ct,name
+        else:
+            blob,ct,name=export_image(out,mode,quality,dpi)
+        if len(blob)>MAX_EXPORT_BYTES: return json_error("Export is too large. Reduce dimensions or quality.")
+        conn=db()
+        conn.execute("UPDATE users SET usage_count=usage_count+1 WHERE id=?",(u["id"],)); conn.commit(); conn.close()
+        log_activity(u["id"],u["email"],"export",json.dumps({"format":mode,"bytes":len(blob)}),request.remote or "")
+        return web.Response(body=blob,content_type=ct,headers={
+            "Content-Disposition":f'attachment; filename="{name}"',
+            "Cache-Control":"no-store",
+            "X-Image-Dimensions":f"{out.width}x{out.height}"
         })
+    except ValueError as e:
+        return json_error(str(e))
     except Exception:
-        log.exception("editor upload failed")
-        return _json_error("Upload failed.", 500)
+        log.exception("editor processing failed")
+        return json_error("Image processing failed. Please try again.",500)
 
 
-async def http_editor_image(request: web.Request) -> web.Response:
-    user, err = _require_user(request)
-    if err is not None:
-        return err
-    token = request.match_info.get("token", "")
+async def http_print_process(request):
+    u, err = require_user(request)
+    if err: return err
+    if not csrf_ok(request,u): return json_error("Security token expired. Refresh and try again.",403)
+    if setting("feature:a4_print","1")!="1" or setting("feature:passport","1")!="1":
+        return json_error("Print Studio is currently disabled.",503)
     try:
-        path = _resolve_image_token(token, user["id"])
-    except ValueError:
-        return _json_error("Image not found.", 404)
-    data = path.read_bytes()
-    ct = "image/jpeg"
-    if path.suffix.lower() == ".png":
-        ct = "image/png"
-    elif path.suffix.lower() == ".webp":
-        ct = "image/webp"
-    elif path.suffix.lower() == ".bmp":
-        ct = "image/bmp"
-    return web.Response(body=data, content_type=ct,
-                        headers={"Cache-Control": "private, max-age=3600"})
-
-
-def _load_token_image(url: str, uid: int) -> Image.Image:
-    token = _url_to_token(url)
-    path = _resolve_image_token(token, uid)
-    return load_image(path.read_bytes())
-
-
-async def http_editor_process(request: web.Request) -> web.Response:
-    user, err = _require_user(request)
-    if err is not None:
-        return err
-    if db_get_setting("feature_photo_editor", "1") != "1":
-        return _json_error("Photo editor is currently disabled.", 403)
-    try:
-        body = await request.json()
-    except Exception:
-        return _json_error("Invalid request body.", 400)
-    image_url = body.get("image")
-    ops = body.get("ops") or []
-    if not image_url or not isinstance(ops, list):
-        return _json_error("Image and operations are required.", 400)
-    if len(ops) > 50:
-        return _json_error("Too many operations in one request.", 400)
-    try:
-        img = _load_token_image(image_url, user["id"])
-    except ValueError:
-        return _json_error("Image not found. Please re-upload.", 404)
-    except Exception:
-        return _json_error("Could not load the image.", 400)
-
-    # Limit heavy operations for safety
-    has_bg = any(op.get("op") in ("background", "remove_bg") for op in ops)
-    loop = asyncio.get_running_loop()
-
-    def _run():
-        return apply_operations(img, ops)
-
-    try:
-        async with _generation_semaphore:
-            result = await asyncio.wait_for(
-                loop.run_in_executor(None, _run),
-                timeout=GENERATION_TIMEOUT)
-    except asyncio.TimeoutError:
-        return _json_error("Processing took too long. Try fewer operations.", 504)
-    except ValueError as exc:
-        return _json_error(str(exc), 400)
-    except Exception:
-        log.exception("editor process failed")
-        return _json_error("Processing failed.", 500)
-
-    # Save result and return new URL
-    token = secrets.token_urlsafe(16)
-    d = user_dir(f"web_{user['id']}")
-    out_path = d / f"{token}.png"
-    # Determine mode for saving
-    save_img = result
-    if result.mode == "RGBA":
-        save_img = result
-    else:
-        save_img = result.convert("RGB")
-    buf = io.BytesIO()
-    save_img.save(buf, "PNG", optimize=True)
-    out_path.write_bytes(buf.getvalue())
-    db_log_usage(user["id"], "editor")
-    return web.json_response({"url": f"/api/editor/image/{token}",
-                              "width": result.width,
-                              "height": result.height})
-
-
-async def http_editor_filters(request: web.Request) -> web.Response:
-    user, err = _require_user(request)
-    if err is not None:
-        return err
-    if db_get_setting("feature_filters", "1") != "1":
-        return _json_error("Filters are currently disabled.", 403)
-    try:
-        body = await request.json()
-    except Exception:
-        return _json_error("Invalid request body.", 400)
-    image_url = body.get("image")
-    if not image_url:
-        return _json_error("Image is required.", 400)
-    try:
-        img = _load_token_image(image_url, user["id"])
-    except ValueError:
-        return _json_error("Image not found.", 404)
-    except Exception:
-        return _json_error("Could not load the image.", 400)
-
-    # Make small previews for each filter
-    preview = make_preview(img)
-    filter_names = ["original", "auto_enhance", "vivid", "warm", "cool",
-                    "vintage", "sepia", "bw", "noir", "fade", "dramatic",
-                    "soft_glow", "matte", "chrome"]
-    previews = {}
-    loop = asyncio.get_running_loop()
-
-    def _gen():
-        out = {}
-        for f in filter_names:
-            try:
-                filtered = apply_filter(preview, f)
-                buf = io.BytesIO()
-                filtered.convert("RGB").save(buf, "JPEG", quality=80)
-                out[f] = "data:image/jpeg;base64," + binascii.b2a_base64(
-                    buf.getvalue()).decode().strip()
-            except Exception:
-                out[f] = ""
-        return out
-
-    try:
-        previews = await loop.run_in_executor(None, _gen)
-    except Exception:
-        log.exception("filter preview failed")
-        return _json_error("Failed to generate filter previews.", 500)
-    return web.json_response({"previews": previews})
-
-
-async def http_editor_export(request: web.Request) -> web.Response:
-    user, err = _require_user(request)
-    if err is not None:
-        return err
-    try:
-        body = await request.json()
-    except Exception:
-        return _json_error("Invalid request body.", 400)
-    image_url = body.get("image")
-    fmt = (body.get("format") or "jpg").lower()
-    quality = int(body.get("quality", 95))
-    if not image_url:
-        return _json_error("Image is required.", 400)
-    if fmt not in ("jpg", "jpeg", "png", "webp", "bmp"):
-        return _json_error("Unsupported format.", 400)
-    try:
-        img = _load_token_image(image_url, user["id"])
-    except ValueError:
-        return _json_error("Image not found.", 404)
-    except Exception:
-        return _json_error("Could not load the image.", 400)
-
-    loop = asyncio.get_running_loop()
-
-    def _run():
-        return export_image(img, fmt, quality)
-
-    try:
-        data = await loop.run_in_executor(None, _run)
-    except Exception:
-        log.exception("export failed")
-        return _json_error("Export failed.", 500)
-
-    db_log_usage(user["id"], "export")
-    ext = "jpg" if fmt in ("jpg", "jpeg") else fmt
-    fname = f"export_{int(time.time())}.{ext}"
-    ct = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-          "webp": "image/webp", "bmp": "image/bmp"}.get(fmt, "application/octet-stream")
-    return web.Response(body=data, content_type=ct,
-                        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
-
-
-# --------------------------------------------------------------------------- #
-# Passport maker endpoint (web)
-# --------------------------------------------------------------------------- #
-
-API_PAGE_DIMS = dict(PAGE_SIZES)
-API_PS_DIMS = {"25x35": (25.0, 35.0), "30x40": (30.0, 40.0),
-               "35x45": (35.0, 45.0), "2x2": (50.8, 50.8)}
-API_BG = {k: rgb_to_hex(v[1]) for k, v in BG_PRESETS.items()}
-
-
-async def http_passport_generate(request: web.Request) -> web.Response:
-    user, err = _require_user(request)
-    if err is not None:
-        return err
-    if db_get_setting("feature_passport_maker", "1") != "1":
-        return _json_error("Passport maker is currently disabled.", 403)
-    try:
-        body = await request.json()
-    except Exception:
-        return _json_error("Invalid request body.", 400)
-    image_url = body.get("image")
-    if not image_url:
-        return _json_error("Image is required.", 400)
-    page_key = str(body.get("page", "A4"))
-    if page_key in API_PAGE_DIMS:
-        page_w, page_h = API_PAGE_DIMS[page_key]
-    elif page_key == "custom":
-        page_w = parse_float(str(body.get("page_w", "")))
-        page_h = parse_float(str(body.get("page_h", "")))
-        if (page_w is None or page_h is None or
-                not (MM_MIN_PAGE <= page_w <= MM_MAX_PAGE) or
-                not (MM_MIN_PAGE <= page_h <= MM_MAX_PAGE)):
-            return _json_error("Invalid custom page size.", 400)
-    else:
-        return _json_error("Invalid page size.", 400)
-
-    bg_key = str(body.get("bg", "skip"))
-    if bg_key == "skip":
-        bg_rgb = None
-    elif bg_key in API_BG:
-        bg_rgb = parse_hex_color(API_BG[bg_key])
-    elif bg_key == "custom":
-        bg_rgb = parse_hex_color(str(body.get("hex", "")))
-        if bg_rgb is None:
-            return _json_error("Invalid HEX background color.", 400)
-    else:
-        return _json_error("Invalid background option.", 400)
-
-    ps_key = str(body.get("ps", "35x45"))
-    if ps_key in API_PS_DIMS:
-        ps_w, ps_h = API_PS_DIMS[ps_key]
-    elif ps_key == "custom":
-        ps_w = parse_float(str(body.get("ps_w", "")))
-        ps_h = parse_float(str(body.get("ps_h", "")))
-        if (ps_w is None or ps_h is None or
-                not (MM_MIN_PHOTO <= ps_w <= MM_MAX_PHOTO) or
-                not (MM_MIN_PHOTO <= ps_h <= MM_MAX_PHOTO)):
-            return _json_error("Invalid custom photo size.", 400)
-    else:
-        return _json_error("Invalid photo size.", 400)
-
-    try:
-        qty = int(body.get("qty", 8))
-    except (TypeError, ValueError):
-        return _json_error("Invalid quantity.", 400)
-    if not (1 <= qty <= MAX_QTY):
-        return _json_error("Quantity must be 1–500.", 400)
-
-    fmt = str(body.get("fmt", "pdf"))
-    if fmt not in ("pdf", "jpg", "png", "pdf_jpg", "pdf_png"):
-        return _json_error("Invalid output format.", 400)
-
-    try:
-        img = _load_token_image(image_url, user["id"])
-        # Re-encode to bytes for generate_files
-        buf = io.BytesIO()
-        img.convert("RGB").save(buf, "JPEG", quality=98)
-        image_bytes = buf.getvalue()
-    except ValueError:
-        return _json_error("Image not found.", 404)
-    except Exception:
-        return _json_error("Could not load the image.", 400)
-
-    loop = asyncio.get_running_loop()
-    try:
-        async with _generation_semaphore:
-            files, pages, note = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None, generate_files, image_bytes, page_w, page_h,
-                    bg_rgb, ps_w, ps_h, qty, fmt),
-                timeout=GENERATION_TIMEOUT)
-    except asyncio.TimeoutError:
-        return _json_error("Processing took too long. Try again or skip the background.",
-                           504)
-    except ValueError as exc:
-        return _json_error(str(exc), 400)
-    except Exception:
-        log.exception("passport generate failed")
-        return _json_error("Generation failed.", 500)
-
-    db_log_usage(user["id"], "passport", len(files))
-
-    # If single file, return it directly; else zip
-    if len(files) == 1:
-        fname, blob = files[0]
-        ct = "application/pdf" if fname.endswith(".pdf") else (
-            "image/jpeg" if fname.endswith(".jpg") else "image/png")
-        return web.Response(body=blob, content_type=ct,
-                            headers={"Content-Disposition": f'attachment; filename="{fname}"'})
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for fname, blob in files:
-            zf.writestr(fname, blob)
-    return web.Response(body=buf.getvalue(), content_type="application/zip",
-                        headers={"Content-Disposition": 'attachment; filename="passport_photos.zip"'})
-
-
-# --------------------------------------------------------------------------- #
-# Admin endpoints
-# --------------------------------------------------------------------------- #
-
-async def http_admin_users(request: web.Request) -> web.Response:
-    user, err = _require_admin(request)
-    if err is not None:
-        return err
-    users = db_list_users()
-    return web.json_response({
-        "users": [_user_dict(u) for u in users],
-        "active_sessions": db_active_session_count(),
-    })
-
-
-async def http_admin_toggle_bot(request: web.Request) -> web.Response:
-    user, err = _require_admin(request)
-    if err is not None:
-        return err
-    try:
-        body = await request.json()
-    except Exception:
-        return _json_error("Invalid request.", 400)
-    target_id = int(body.get("user_id", 0))
-    target = db_get_user_by_id(target_id)
-    if target is None:
-        return _json_error("User not found.", 404)
-    db_update_user(target_id, has_bot_access=0 if target["has_bot_access"] else 1)
-    db_log_activity(user["id"], "toggle_bot_access",
-                    details=f"user={target_id}", ip=_client_ip(request))
-    return web.json_response({"ok": True})
-
-
-async def http_admin_toggle_ban(request: web.Request) -> web.Response:
-    user, err = _require_admin(request)
-    if err is not None:
-        return err
-    try:
-        body = await request.json()
-    except Exception:
-        return _json_error("Invalid request.", 400)
-    target_id = int(body.get("user_id", 0))
-    reason = (body.get("reason") or "")[:200]
-    target = db_get_user_by_id(target_id)
-    if target is None:
-        return _json_error("User not found.", 404)
-    if target["is_admin"]:
-        return _json_error("Cannot ban an admin.", 400)
-    new_ban = 0 if target["is_banned"] else 1
-    db_update_user(target_id, is_banned=new_ban, banned_reason=reason,
-                   is_active=0 if new_ban else 1)
-    db_log_activity(user["id"], "toggle_ban",
-                    details=f"user={target_id} reason={reason}", ip=_client_ip(request))
-    return web.json_response({"ok": True})
-
-
-async def http_admin_toggle_admin(request: web.Request) -> web.Response:
-    user, err = _require_admin(request)
-    if err is not None:
-        return err
-    try:
-        body = await request.json()
-    except Exception:
-        return _json_error("Invalid request.", 400)
-    target_id = int(body.get("user_id", 0))
-    target = db_get_user_by_id(target_id)
-    if target is None:
-        return _json_error("User not found.", 404)
-    if target["id"] == user["id"]:
-        return _json_error("Cannot change your own admin status.", 400)
-    db_update_user(target_id, is_admin=0 if target["is_admin"] else 1)
-    db_log_activity(user["id"], "toggle_admin",
-                    details=f"user={target_id}", ip=_client_ip(request))
-    return web.json_response({"ok": True})
-
-
-async def http_admin_activity(request: web.Request) -> web.Response:
-    user, err = _require_admin(request)
-    if err is not None:
-        return err
-    rows = db_recent_activity(200)
-    return web.json_response([dict(r) for r in rows])
-
-
-async def http_admin_features_get(request: web.Request) -> web.Response:
-    user, err = _require_admin(request)
-    if err is not None:
-        return err
-    settings = db_get_all_settings()
-    feats = {k: v for k, v in settings.items() if k.startswith("feature_")}
-    return web.json_response(feats)
-
-
-async def http_admin_features_put(request: web.Request) -> web.Response:
-    user, err = _require_admin(request)
-    if err is not None:
-        return err
-    try:
-        body = await request.json()
-    except Exception:
-        return _json_error("Invalid request.", 400)
-    for k, v in body.items():
-        if k.startswith("feature_"):
-            db_set_setting(k, "1" if v in (True, "1", 1) else "0")
-    db_log_activity(user["id"], "update_features", ip=_client_ip(request))
-    return web.json_response({"ok": True})
-
-
-async def http_admin_settings_get(request: web.Request) -> web.Response:
-    user, err = _require_admin(request)
-    if err is not None:
-        return err
-    s = db_get_all_settings()
-    return web.json_response({
-        "site_name": s.get("site_name", ""),
-        "max_upload_mb": s.get("max_upload_mb", "25"),
-        "registration_open": s.get("registration_open", "1"),
-        "maintenance_mode": s.get("maintenance_mode", "0"),
-        "maintenance_message": s.get("maintenance_message", ""),
-    })
-
-
-async def http_admin_settings_put(request: web.Request) -> web.Response:
-    user, err = _require_admin(request)
-    if err is not None:
-        return err
-    try:
-        body = await request.json()
-    except Exception:
-        return _json_error("Invalid request.", 400)
-    if "site_name" in body:
-        db_set_setting("site_name", str(body["site_name"])[:100])
-    if "max_upload_mb" in body:
-        try:
-            mb = int(body["max_upload_mb"])
-            if 1 <= mb <= 100:
-                db_set_setting("max_upload_mb", str(mb))
-        except (TypeError, ValueError):
-            pass
-    if "registration_open" in body:
-        db_set_setting("registration_open", "1" if body["registration_open"] in (True, "1", 1) else "0")
-    if "maintenance_mode" in body:
-        db_set_setting("maintenance_mode", "1" if body["maintenance_mode"] in (True, "1", 1) else "0")
-    if "maintenance_message" in body:
-        db_set_setting("maintenance_message", str(body["maintenance_message"])[:500])
-    db_log_activity(user["id"], "update_system_settings", ip=_client_ip(request))
-    return web.json_response({"ok": True})
-
-
-# --------------------------------------------------------------------------- #
-# Mini App API (preserved for Telegram users)
-# --------------------------------------------------------------------------- #
-
-async def http_mini_generate(request: web.Request) -> web.Response:
-    try:
-        reader = await request.multipart()
-        photo_bytes = None
-        payload = None
-        init_data = ""
+        reader=await request.multipart()
+        photo=None; payload={}
         async for part in reader:
-            if part.name == "initData":
-                init_data = (await part.read(decode=False)).decode("utf-8", "ignore")
-            elif part.name == "photo":
-                photo_bytes = await part.read(decode=False)
-            elif part.name == "payload":
-                try:
-                    payload = json.loads((await part.read(decode=False)).decode("utf-8"))
-                except Exception:
-                    payload = None
-        if not photo_bytes or not isinstance(payload, dict):
-            return _json_error("Photo and settings are required.", 400)
-
-        page_key = str(payload.get("page", ""))
-        if page_key in API_PAGE_DIMS:
-            page_w, page_h = API_PAGE_DIMS[page_key]
-        elif page_key == "custom":
-            page_w = parse_float(str(payload.get("page_w", "")))
-            page_h = parse_float(str(payload.get("page_h", "")))
-            if (page_w is None or page_h is None or
-                    not (MM_MIN_PAGE <= page_w <= MM_MAX_PAGE) or
-                    not (MM_MIN_PAGE <= page_h <= MM_MAX_PAGE)):
-                return _json_error("Invalid custom page size.", 400)
+            if part.name=="photo": photo=await part.read(decode=False)
+            elif part.name=="payload":
+                try: payload=json.loads((await part.read(decode=False)).decode())
+                except Exception: payload={}
+        if not photo: return json_error("No image was uploaded.")
+        img=apply_editor_ops(load_image(photo),payload)
+        page=payload.get("page",{})
+        ps=payload.get("photo_size",{})
+        pw=float(page.get("w",210)); ph=float(page.get("h",297))
+        sw=float(ps.get("w",35)); sh=float(ps.get("h",45))
+        qty=max(1,min(MAX_QTY,int(payload.get("qty",1))))
+        if not (MM_MIN_PAGE<=pw<=MM_MAX_PAGE and MM_MIN_PAGE<=ph<=MM_MAX_PAGE):
+            return json_error("Invalid page dimensions.")
+        if not (MM_MIN_PHOTO<=sw<=MM_MAX_PHOTO and MM_MIN_PHOTO<=sh<=MM_MAX_PHOTO):
+            return json_error("Invalid photo dimensions.")
+        grid=compute_grid(pw,ph,sw,sh)
+        if grid is None:
+            return json_error("The selected photo size does not fit on this page.")
+        pages=math.ceil(qty/(grid[0]*grid[1]))
+        sheet=build_sheet(img,pw,ph,sw,sh,qty)
+        fmt=str(payload.get("export","pdf")).lower()
+        if fmt=="pdf":
+            b=io.BytesIO(); sheet.save(b,"PDF",resolution=float(DPI))
+            blob,ct,name=b.getvalue(),"application/pdf","photo-sheet.pdf"
         else:
-            return _json_error("Invalid page size.", 400)
-
-        bg_key = str(payload.get("bg", "skip"))
-        if bg_key == "skip":
-            bg_rgb = None
-        elif bg_key in API_BG:
-            bg_rgb = parse_hex_color(API_BG[bg_key])
-        elif bg_key == "custom":
-            bg_rgb = parse_hex_color(str(payload.get("hex", "")))
-            if bg_rgb is None:
-                return _json_error("Invalid HEX background color.", 400)
-        else:
-            return _json_error("Invalid background option.", 400)
-
-        ps_key = str(payload.get("ps", ""))
-        if ps_key in API_PS_DIMS:
-            ps_w, ps_h = API_PS_DIMS[ps_key]
-        elif ps_key == "custom":
-            ps_w = parse_float(str(payload.get("ps_w", "")))
-            ps_h = parse_float(str(payload.get("ps_h", "")))
-            if (ps_w is None or ps_h is None or
-                    not (MM_MIN_PHOTO <= ps_w <= MM_MAX_PHOTO) or
-                    not (MM_MIN_PHOTO <= ps_h <= MM_MAX_PHOTO)):
-                return _json_error("Invalid custom photo size.", 400)
-        else:
-            return _json_error("Invalid photo size.", 400)
-
-        try:
-            qty = int(payload.get("qty"))
-        except (TypeError, ValueError):
-            return _json_error("Invalid quantity.", 400)
-        if not (1 <= qty <= MAX_QTY):
-            return _json_error("Quantity must be 1–500.", 400)
-
-        fmt = str(payload.get("fmt", ""))
-        if fmt not in ("pdf", "jpg", "png", "pdf_jpg", "pdf_png"):
-            return _json_error("Invalid output format.", 400)
-
-        try:
-            image_bytes = photo_bytes
-            load_image(image_bytes).close()
-        except Exception:
-            return _json_error("The uploaded file is not a valid image.", 400)
-
-        loop = asyncio.get_running_loop()
-        try:
-            async with _generation_semaphore:
-                files, pages, note = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        None, generate_files, image_bytes, page_w, page_h,
-                        bg_rgb, ps_w, ps_h, qty, fmt),
-                    timeout=GENERATION_TIMEOUT)
-            global _generation_count
-            _generation_count += 1
-        except asyncio.TimeoutError:
-            return _json_error("Processing took too long.", 504)
-        except ValueError as exc:
-            return _json_error(str(exc), 400)
-
-        uid = verify_init_data(init_data)
-        if uid and _bot is not None:
-            try:
-                caption = (f"🖨 Done! {qty} photo(s), {pages} page(s), "
-                           f"{ps_w:g} × {ps_h:g} mm @ {DPI} DPI.")
-                if note:
-                    await _bot.send_message(uid, note)
-                for fname, blob in files:
-                    await _bot.send_document(
-                        uid, BufferedInputFile(blob, filename=fname),
-                        caption=caption)
-                return web.json_response({"sent": True, "files": len(files)})
-            except Exception:
-                log.warning("mini app: sending to chat failed; falling back",
-                            exc_info=True)
-
-        def _ctype(name):
-            n = name.lower()
-            if n.endswith(".pdf"):
-                return "application/pdf"
-            if n.endswith(".jpg") or n.endswith(".jpeg"):
-                return "image/jpeg"
-            if n.endswith(".png"):
-                return "image/png"
-            return "application/octet-stream"
-
-        if len(files) == 1:
-            fname, blob = files[0]
-            return web.Response(
-                body=blob,
-                headers={"Content-Disposition": f'attachment; filename="{fname}"',
-                         "Content-Type": _ctype(fname)})
-
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for fname, blob in files:
-                zf.writestr(fname, blob)
-        return web.Response(
-            body=buf.getvalue(),
-            headers={"Content-Disposition": 'attachment; filename="passport_photos.zip"',
-                     "Content-Type": "application/zip"})
+            blob,ct,name=export_image(sheet,fmt,int(payload.get("quality",95)),DPI)
+        if len(blob)>MAX_EXPORT_BYTES: return json_error("Export is too large.")
+        conn=db(); conn.execute("UPDATE users SET usage_count=usage_count+1 WHERE id=?",(u["id"],)); conn.commit(); conn.close()
+        log_activity(u["id"],u["email"],"print_export",json.dumps({"format":fmt,"qty":qty,"pages":pages}),request.remote or "")
+        return web.Response(body=blob,content_type=ct,headers={"Content-Disposition":f'attachment; filename="{name}"',"Cache-Control":"no-store"})
     except Exception:
-        log.exception("mini app generate failed")
-        return _json_error("Something went wrong while generating.", 500)
+        log.exception("print processing failed")
+        return json_error("Print generation failed. Please check the dimensions and try again.",500)
 
+async def http_admin_users(request):
+    u,err=require_admin(request)
+    if err:return err
+    conn=db()
+    rows=conn.execute("""SELECT id,email,role,bot_access,banned,created_at,last_login,usage_count
+                         FROM users ORDER BY created_at DESC""").fetchall()
+    conn.close()
+    return web.json_response({"users":[dict(r) for r in rows]})
 
-# --------------------------------------------------------------------------- #
-# Web server plumbing
-# --------------------------------------------------------------------------- #
+async def http_admin_user_update(request):
+    u,err=require_admin(request)
+    if err:return err
+    if not csrf_ok(request,u): return json_error("Invalid security token.",403)
+    try: uid=int(request.match_info["id"])
+    except: return json_error("Invalid user id.")
+    data=await read_json(request)
+    if not isinstance(data,dict): return json_error("Invalid request.")
+    fields={}
+    for k in ("bot_access","banned"):
+        if k in data: fields[k]=1 if bool(data[k]) else 0
+    if "role" in data and data["role"] in ("user","admin"): fields["role"]=data["role"]
+    if not fields:return json_error("Nothing to update.")
+    conn=db()
+    sets=",".join(f"{k}=?" for k in fields)
+    conn.execute(f"UPDATE users SET {sets} WHERE id=?",(*fields.values(),uid)); conn.commit()
+    row=conn.execute("SELECT email FROM users WHERE id=?",(uid,)).fetchone()
+    if fields.get("banned")==1: conn.execute("DELETE FROM sessions WHERE user_id=?",(uid,)); conn.commit()
+    conn.close()
+    log_activity(u["id"],u["email"],"admin_user_update",json.dumps({"target":uid,"changes":fields}),request.remote or "")
+    return web.json_response({"ok":True,"email":row["email"] if row else None})
 
-async def http_index(request: web.Request) -> web.Response:
-    return web.Response(text=APP_HTML, content_type="text/html")
+async def http_admin_activity(request):
+    u,err=require_admin(request)
+    if err:return err
+    conn=db()
+    rows=conn.execute("SELECT * FROM activity ORDER BY id DESC LIMIT 200").fetchall()
+    conn.close()
+    return web.json_response({"activity":[dict(r) for r in rows]})
 
+async def http_admin_settings(request):
+    u,err=require_admin(request)
+    if err:return err
+    if request.method=="GET":
+        features={k.split(":",1)[1]: setting(k,"0")=="1" for k in [f"feature:{x}" for x in FEATURE_DEFAULTS]}
+        return web.json_response({"maintenance":setting("maintenance","0")=="1",
+                                  "maintenance_message":setting("maintenance_message",""),
+                                  "features":features})
+    if not csrf_ok(request,u): return json_error("Invalid security token.",403)
+    data=await read_json(request)
+    if not isinstance(data,dict): return json_error("Invalid request.")
+    if "maintenance" in data:set_setting("maintenance","1" if data["maintenance"] else "0")
+    if "maintenance_message" in data:set_setting("maintenance_message",str(data["maintenance_message"])[:500])
+    if isinstance(data.get("features"),dict):
+        for k,v in data["features"].items():
+            if k in FEATURE_DEFAULTS:set_setting(f"feature:{k}","1" if v else "0")
+    log_activity(u["id"],u["email"],"admin_settings",json.dumps(data),request.remote or "")
+    return web.json_response({"ok":True})
 
-async def http_favicon(request: web.Request) -> web.Response:
-    return web.Response(status=204)
+async def http_admin_info(request):
+    u,err=require_admin(request)
+    if err:return err
+    conn=db()
+    users=conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+    active=conn.execute("SELECT COUNT(*) c FROM users WHERE banned=0").fetchone()["c"]
+    exports=conn.execute("SELECT COALESCE(SUM(usage_count),0) c FROM users").fetchone()["c"]
+    conn.close()
+    return web.json_response({"users":users,"active_users":active,"exports":exports,
+                              "uptime_seconds":round(time.time()-_started_at,1),
+                              "rembg":REMBG_AVAILABLE or USE_REMBG})
 
+PREMIUM_HTML = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>PhotoForge — Professional Photo Editor</title>
+<style>
+:root{--bg:#08090c;--panel:#11131a;--panel2:#171a22;--line:#272b36;--text:#f7f7f8;--muted:#9da3af;--red:#e11d2e;--red2:#ff4050;--redbg:#2a0e13;--green:#36d399;--shadow:0 20px 60px #0009}
+*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:radial-gradient(900px 500px at 20% -10%,#3b0d14 0,#08090c 55%);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial}
+button,input,select{font:inherit}button{cursor:pointer}.hidden{display:none!important}.app{min-height:100vh}.auth{min-height:100vh;display:grid;place-items:center;padding:22px}.auth-card{width:min(430px,100%);background:#101219e8;border:1px solid var(--line);border-radius:28px;padding:30px;box-shadow:var(--shadow);backdrop-filter:blur(20px)}
+.logo{display:flex;align-items:center;gap:12px;font-weight:800;font-size:22px}.logo-mark{width:40px;height:40px;border-radius:13px;background:linear-gradient(135deg,var(--red2),#9d0918);display:grid;place-items:center;box-shadow:0 10px 30px #e11d2e44}.eyebrow{color:#ff7180;font-size:12px;text-transform:uppercase;letter-spacing:.14em;font-weight:800;margin:25px 0 8px}.auth h1{font-size:32px;margin:0 0 8px}.muted{color:var(--muted)}.tabs{display:flex;background:#0a0b0f;border:1px solid var(--line);padding:4px;border-radius:13px;margin:22px 0 16px}.tabs button{flex:1;border:0;background:transparent;color:var(--muted);padding:11px;border-radius:10px}.tabs button.on{background:#242832;color:#fff}.field{margin:12px 0}.field label{display:block;font-size:12px;color:#b7bcc7;margin:0 0 7px}.field input,.field select{width:100%;padding:13px 14px;border:1px solid var(--line);border-radius:12px;background:#0b0d12;color:#fff;outline:none}.field input:focus{border-color:#e11d2e88;box-shadow:0 0 0 3px #e11d2e1b}.primary{width:100%;padding:14px;border:0;border-radius:13px;background:linear-gradient(135deg,var(--red2),var(--red));color:#fff;font-weight:800;box-shadow:0 12px 30px #e11d2e33}.danger{background:#341017;color:#ff9aa4;border:1px solid #62202a}.appbar{height:68px;border-bottom:1px solid var(--line);background:#0b0d11dd;backdrop-filter:blur(16px);display:flex;align-items:center;justify-content:space-between;padding:0 max(18px,calc((100vw - 1400px)/2));position:sticky;top:0;z-index:20}.user-pill{display:flex;align-items:center;gap:10px}.avatar{width:34px;height:34px;border-radius:11px;background:var(--redbg);display:grid;place-items:center;color:#ff7a86;font-weight:800}.layout{max-width:1400px;margin:auto;padding:22px;display:grid;grid-template-columns:230px 1fr;gap:22px}.side{background:#0e1016;border:1px solid var(--line);border-radius:20px;padding:12px;height:max-content;position:sticky;top:90px}.side button{width:100%;text-align:left;background:transparent;color:#aeb4bf;border:0;padding:12px;border-radius:11px;margin:2px 0}.side button.on,.side button:hover{background:#241116;color:#fff}.content{min-width:0}.hero{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin:5px 0 20px}.hero h1{font-size:32px;margin:0 0 5px}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.card{background:linear-gradient(180deg,#151820,#101218);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:0 10px 30px #0002}.stat .num{font-size:26px;font-weight:850;margin-top:6px}.stat .label{font-size:12px;color:var(--muted)}.upload{border:1px dashed #3a404d;border-radius:20px;min-height:280px;display:grid;place-items:center;text-align:center;padding:28px;background:radial-gradient(400px 200px at 50% 0,#33101855,transparent)}.upload-icon{font-size:40px}.tool-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.tool{background:#151820;border:1px solid var(--line);border-radius:15px;padding:15px;text-align:left;color:#fff}.tool:hover{border-color:#e11d2e77;transform:translateY(-1px)}.tool b{display:block;margin-bottom:5px}.tool span{font-size:12px;color:var(--muted)}.editor{display:grid;grid-template-columns:minmax(0,1fr) 330px;gap:16px}.canvas-card{background:#0c0e13;border:1px solid var(--line);border-radius:20px;padding:15px;min-height:500px;display:grid;place-items:center}.stage{width:100%;height:min(65vh,680px);display:grid;place-items:center;background:repeating-conic-gradient(#151820 0 25%,#101218 0 50%) 50%/24px 24px;border-radius:14px;overflow:hidden}.stage canvas{max-width:100%;max-height:100%;object-fit:contain}.controls{display:grid;gap:12px}.range{display:grid;grid-template-columns:1fr 46px;gap:8px;align-items:center}.range input[type=range]{width:100%;accent-color:var(--red2)}.range output{font-size:11px;color:#c8ccd4;text-align:right}.toolbar{display:flex;gap:8px;flex-wrap:wrap}.toolbar button{border:1px solid var(--line);background:#151820;color:#fff;border-radius:10px;padding:9px 11px}.toolbar button:hover{border-color:#e11d2e66}.bottom{display:flex;gap:10px;margin-top:12px}.bottom>*{flex:1}.table-wrap{overflow:auto}.table{width:100%;border-collapse:collapse;font-size:13px}.table th,.table td{padding:11px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}.switch{display:flex;align-items:center;justify-content:space-between;padding:10px 0}.switch input{accent-color:var(--red)}.toast{position:fixed;right:18px;bottom:18px;background:#161920;border:1px solid #343945;border-radius:13px;padding:13px 15px;box-shadow:var(--shadow);z-index:50}.modal{position:fixed;inset:0;background:#000a;display:grid;place-items:center;padding:18px;z-index:40}.modal-card{width:min(560px,100%);max-height:90vh;overflow:auto;background:#11141a;border:1px solid var(--line);border-radius:22px;padding:20px}.progress{height:5px;background:#242832;border-radius:99px;overflow:hidden}.progress i{display:block;height:100%;width:0;background:var(--red2);transition:.2s}.badge{font-size:11px;padding:4px 8px;border-radius:99px;background:#252932;color:#cdd2dc}.badge.red{background:#351118;color:#ff9aa4}.badge.green{background:#0d2c22;color:#76e4bb}
+@media(max-width:1000px){.layout{grid-template-columns:1fr}.side{position:static;display:flex;overflow:auto}.side button{min-width:max-content}.cards{grid-template-columns:repeat(2,1fr)}.editor{grid-template-columns:1fr}.controls{grid-template-columns:1fr 1fr}.controls .wide{grid-column:1/-1}}
+@media(max-width:600px){.layout{padding:14px}.appbar{padding:0 14px}.hero{display:block}.hero h1{font-size:26px}.cards{grid-template-columns:1fr 1fr}.tool-grid{grid-template-columns:1fr 1fr}.controls{grid-template-columns:1fr}.auth-card{padding:22px}.stage{height:52vh}.user-pill .email{display:none}}
+</style></head>
+<body><div id="root"></div><div id="toast" class="toast hidden"></div>
+<script>
+const $=s=>document.querySelector(s), root=$("#root");
+let me=null,csrf="",file=null,img=null,canvas=null,ctx=null,history=[],future=[],active="editor";
+const defaults={brightness:0,contrast:0,exposure:0,saturation:0,sharpness:0,warmth:0,tint:0,denoise:0};
+let adj={...defaults},rotation=0,flipH=false,flipV=false,crop=null;
+function toast(m){const t=$("#toast");t.textContent=m;t.classList.remove("hidden");setTimeout(()=>t.classList.add("hidden"),2800)}
+async function api(url,opt={}){opt.headers={...(opt.headers||{}),"Content-Type":"application/json"};if(csrf)opt.headers["X-CSRF-Token"]=csrf;const r=await fetch(url,opt);let d={};try{d=await r.json()}catch{}if(!r.ok)throw Error(d.error||"Request failed");return d}
+async function boot(){try{const d=await fetch("/api/auth/me",{cache:"no-store"}).then(r=>r.json());if(d.authenticated){me=d.user;csrf=d.csrf;renderApp()}else renderAuth()}catch(e){renderAuth()}}
+function renderAuth(mode="login"){root.innerHTML=`<main class="auth"><section class="auth-card">
+<div class="logo"><div class="logo-mark">✦</div>PhotoForge</div><div class="eyebrow">Professional photo studio</div><h1>${mode==="login"?"Welcome back":"Create your account"}</h1><p class="muted">Secure workspace for high-quality editing, passport photos and print-ready exports.</p>
+<div class="tabs"><button class="${mode==="login"?"on":""}" onclick="renderAuth('login')">Login</button><button class="${mode==="register"?"on":""}" onclick="renderAuth('register')">Create Account</button></div>
+<form onsubmit="authSubmit(event,'${mode}')"><div class="field"><label>Email / Gmail</label><input id="email" type="email" autocomplete="email" required placeholder="you@gmail.com"></div>
+<div class="field"><label>Password</label><input id="password" type="password" minlength="8" autocomplete="${mode==="login"?"current-password":"new-password"}" required placeholder="Minimum 8 characters"></div>
+${mode==="register"?'<div class="field"><label>Confirm password</label><input id="password2" type="password" minlength="8" required placeholder="Repeat password"></div>':''}
+<button class="primary" type="submit">${mode==="login"?"Login securely":"Create account"}</button></form>
+<p class="muted" style="font-size:11px;margin-top:18px">Your editing files are processed temporarily and are designed to be removed after processing.</p></section></main>`}
+async function authSubmit(e,mode){e.preventDefault();const email=$("#email").value.trim(),password=$("#password").value;if(mode==="register"&&password!==$("#password2").value)return toast("Passwords do not match");try{const d=await api("/api/auth/"+mode,{method:"POST",body:JSON.stringify({email,password})});csrf=d.csrf;const m=await fetch("/api/auth/me").then(r=>r.json());me=m.user;csrf=m.csrf;renderApp();toast(mode==="login"?"Welcome back":"Account created")}catch(e){toast(e.message)}}
+function renderApp(){root.innerHTML=`<header class="appbar"><div class="logo"><div class="logo-mark">✦</div>PhotoForge</div><div class="user-pill"><div class="avatar">${me.email[0].toUpperCase()}</div><span class="email">${me.email}</span>${me.role==="admin"?'<span class="badge red">ADMIN</span>':''}<button class="toolbar" style="border:0;background:transparent;color:#bbb" onclick="logout()">↪</button></div></header>
+<div class="layout"><nav class="side"><button class="on" onclick="showPanel('editor',this)">✦ Editor</button><button onclick="showPanel('prints',this)">▣ Print Studio</button>${me.role==="admin"?'<button onclick="showPanel(\'admin\',this)">⚙ Admin Panel</button>':''}</nav><main class="content" id="panel"></main></div>`;showPanel("editor",document.querySelector(".side button"))}
+function showPanel(name,btn){active=name;document.querySelectorAll(".side button").forEach(x=>x.classList.remove("on"));if(btn)btn.classList.add("on");if(name==="admin")renderAdmin();else if(name==="prints")renderPrints();else renderEditor()}
+function renderChooser(){panel.innerHTML=`<div class="hero"><div><div class="eyebrow" style="margin-top:0">New image</div><h1>What would you like to do?</h1><p class="muted">Choose a focused workflow or open the complete professional editor.</p></div></div>
+<section class="card"><div class="tool-grid">
+<button class="tool" onclick="openEditor()"><b>✦ Full Editor</b><span>All professional adjustments</span></button>
+<button class="tool" onclick="openEditor()"><b>✂ Crop & Resize</b><span>Precise framing and dimensions</span></button>
+<button class="tool" onclick="openEditor()"><b>✨ Enhance Quality</b><span>Natural sharpness and clarity</span></button>
+<button class="tool" onclick="openEditor()"><b>🎨 Adjust Colors</b><span>Exposure, saturation, warmth</span></button>
+<button class="tool" onclick="openEditor()"><b>🪄 Background</b><span>Clean solid-color backgrounds</span></button>
+<button class="tool" onclick="showPanel('prints',document.querySelectorAll('.side button')[1])"><b>▣ Passport / A4</b><span>Print-ready photo layouts</span></button>
+</div></section>
+<div class="card"><div class="toolbar"><button onclick="deleteWorkspace()">Delete uploaded image</button><span class="muted" style="font-size:12px">Your source stays local until an export is requested.</span></div></div>`}
+function renderEditor(){
+if(!file){
+ panel.innerHTML=`<div class="hero"><div><div class="eyebrow" style="margin-top:0">Creative workspace</div><h1>Photo Editor</h1><p class="muted">Upload an image to start.</p></div></div>
+ <section class="card upload" onclick="document.getElementById('fileInput').click()"><div><div class="upload-icon">⌁</div><h2>Upload an image</h2><p class="muted">JPG, PNG, WEBP • up to 25 MB</p><button class="primary" style="width:auto;margin-top:16px">Choose image</button></div><input id="fileInput" type="file" accept="image/*" hidden onchange="loadFile(this.files[0])"></section>`;
+ return;
+}
+panel.innerHTML=`<div class="hero"><div><div class="eyebrow" style="margin-top:0">Creative workspace</div><h1>Photo Editor</h1><p class="muted">Natural enhancement, precise crop and print-ready export.</p></div><span class="badge">High quality • 300 DPI</span></div>
+<section class="editor"><div><div class="card"><div class="toolbar"><button onclick="snapshot();rotation=(rotation+90)%360;draw()">↻ Rotate</button><button onclick="snapshot();flipH=!flipH;draw()">⇋ Flip H</button><button onclick="snapshot();flipV=!flipV;draw()">⇵ Flip V</button><button onclick="undo()">↶ Undo</button><button onclick="redo()">↷ Redo</button><button onclick="resetEdit()">Reset</button><button onclick="document.getElementById('fileInput').click()">Replace</button><input id="fileInput" type="file" accept="image/*" hidden onchange="loadFile(this.files[0])"></div></div>
+<div class="canvas-card"><div class="stage"><canvas id="canvas"></canvas></div></div>
+<div class="bottom"><button class="primary" onclick="exportNow('jpg')">Export JPG</button><button class="primary" onclick="exportNow('png')">Export PNG</button><button class="primary" onclick="exportNow('pdf')">Create PDF</button><button class="danger" onclick="deleteWorkspace()">Delete</button></div></div>
+<aside class="controls"><div class="card"><h3>Adjustments</h3>${range("brightness","Brightness",-100,100)}${range("contrast","Contrast",-100,100)}${range("exposure","Exposure",-100,100)}${range("saturation","Saturation",-100,100)}${range("sharpness","Sharpness",0,100)}${range("warmth","Warmth",-100,100)}${range("tint","Tint",-100,100)}${range("denoise","Soft Denoise",0,100)}</div>
+<div class="card"><h3>Background</h3><select id="bgColor"><option value="">Keep original</option><option value="#FFFFFF">White</option><option value="#1565C0">Blue</option><option value="#D32F2F">Red</option><option value="#2E7D32">Green</option></select><p class="muted" style="font-size:11px;margin-top:8px">Best for plain, clean backgrounds. Original is kept if detection is unsafe.</p></div>
+<div class="card"><h3>Export quality</h3><div class="field"><label>JPG quality</label><input id="quality" type="range" min="60" max="100" value="95" oninput="document.getElementById('qv').textContent=this.value"></div><span class="badge" id="qv">95</span></div></aside></section>`;
+canvas=document.getElementById("canvas");ctx=canvas.getContext("2d");draw()
+}
+function range(k,label,min,max){return `<div class="field"><label>${label}</label><div class="range"><input type="range" min="${min}" max="${max}" value="${adj[k]}" oninput="adj['${k}']=+this.value;draw()"><output>${adj[k]}</output></div></div>`}
+function loadFile(f){if(!f)return;if(f.size>25*1024*1024)return toast("Image is too large (25 MB max)");file=f;const r=new FileReader();r.onload=()=>{img=new Image();img.onload=()=>{adj={...defaults};rotation=0;flipH=flipV=false;history=[];future=[];renderChooser();};img.src=r.result};r.readAsDataURL(f)}
+function openEditor(){renderEditor()}
+function deleteWorkspace(){file=null;img=null;canvas=null;ctx=null;history=[];future=[];adj={...defaults};rotation=0;flipH=flipV=false;renderEditor();toast("Workspace cleared and local image removed")}
+function snapshot(){history.push(JSON.stringify({adj,rotation,flipH,flipV}));if(history.length>30)history.shift();future=[]}
+function undo(){if(!history.length)return;future.push(JSON.stringify({adj,rotation,flipH,flipV}));Object.assign(window,{});let s=JSON.parse(history.pop());adj=s.adj;rotation=s.rotation;flipH=s.flipH;flipV=s.flipV;renderEditor()}
+function redo(){if(!future.length)return;history.push(JSON.stringify({adj,rotation,flipH,flipV}));let s=JSON.parse(future.pop());adj=s.adj;rotation=s.rotation;flipH=s.flipH;flipV=s.flipV;renderEditor()}
+function resetEdit(){snapshot();adj={...defaults};rotation=0;flipH=flipV=false;draw()}
+function draw(){if(!img||!canvas)return;let max=1400,scale=Math.min(1,max/img.width,max/img.height);let w=Math.round(img.width*scale),h=Math.round(img.height*scale);canvas.width=w;canvas.height=h;ctx.save();ctx.clearRect(0,0,w,h);ctx.translate(w/2,h/2);ctx.rotate(rotation*Math.PI/180);ctx.scale(flipH?-1:1,flipV?-1:1);ctx.filter=`brightness(${100+adj.brightness}%) contrast(${100+adj.contrast}%) saturate(${100+adj.saturation}%)`;ctx.drawImage(img,-w/2,-h/2,w,h);ctx.restore();document.querySelectorAll(".range output").forEach((o,i)=>o.textContent=Object.values(adj)[i])}
+async function exportNow(fmt){if(!file)return;const fd=new FormData();fd.append("photo",file);const payload={export:fmt,quality:+$("#quality").value,rotation,flip_h:flipH,flip_v:flipV,adjustments:adj,background:{mode:$("#bgColor").value?"solid":"none",color:$("#bgColor").value}};fd.append("payload",JSON.stringify(payload));const r=await fetch("/api/editor/process",{method:"POST",headers:{"X-CSRF-Token":csrf},body:fd});if(!r.ok){let d=await r.json().catch(()=>({}));return toast(d.error||"Export failed")}const blob=await r.blob();const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=r.headers.get("Content-Disposition")?.match(/filename="([^"]+)/)?.[1]||`edited.${fmt}`;a.click();URL.revokeObjectURL(a.href);toast("Export complete")}
+function renderPrints(){panel.innerHTML=`<div class="hero"><div><div class="eyebrow" style="margin-top:0">Print Studio</div><h1>Passport & A4 layouts</h1><p class="muted">Exact physical sizes, automatic arrangement and high-quality output.</p></div></div>
+<section class="card"><div class="field"><label>Photo</label><input id="printFile" type="file" accept="image/*" onchange="printFile=this.files[0]"></div>
+<div class="tool-grid"><button class="tool" onclick="setPrintSize(35,45)"><b>35 × 45 mm</b><span>Passport</span></button><button class="tool" onclick="setPrintSize(25,35)"><b>25 × 35 mm</b><span>ID photo</span></button><button class="tool" onclick="setPrintSize(50.8,50.8)"><b>2 × 2 inch</b><span>Square</span></button></div>
+<div class="cards" style="margin-top:14px"><div class="field"><label>Page width (mm)</label><input id="pageW" type="number" value="210" min="50"></div><div class="field"><label>Page height (mm)</label><input id="pageH" type="number" value="297" min="50"></div><div class="field"><label>Photo width (mm)</label><input id="photoW" type="number" value="35" min="10"></div><div class="field"><label>Photo height (mm)</label><input id="photoH" type="number" value="45" min="10"></div><div class="field"><label>Quantity</label><input id="qty" type="number" value="8" min="1" max="500"></div><div class="field"><label>Format</label><select id="printFmt"><option value="pdf">PDF</option><option value="jpg">JPG</option><option value="png">PNG</option></select></div></div>
+<div class="bottom"><button class="primary" onclick="generatePrint()">Generate print sheet</button><button class="danger" onclick="showPanel('editor',document.querySelector('.side button'))">Back to editor</button></div></section>`}
+let printFile=null;
+function setPrintSize(w,h){$("#photoW").value=w;$("#photoH").value=h}
+async function generatePrint(){if(!printFile)return toast("Choose a photo first");const fd=new FormData();fd.append("photo",printFile);fd.append("payload",JSON.stringify({page:{w:+$("#pageW").value,h:+$("#pageH").value},photo_size:{w:+$("#photoW").value,h:+$("#photoH").value},qty:+$("#qty").value,export:$("#printFmt").value}));const r=await fetch("/api/print/process",{method:"POST",headers:{"X-CSRF-Token":csrf},body:fd});if(!r.ok){const d=await r.json().catch(()=>({}));return toast(d.error||"Print generation failed")}const blob=await r.blob(),fmt=$("#printFmt").value,a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=`photo-sheet.${fmt}`;a.click();URL.revokeObjectURL(a.href);toast("Print sheet generated")}
+async function renderAdmin(){panel.innerHTML=`<div class="hero"><div><div class="eyebrow" style="margin-top:0">Control center</div><h1>Admin Panel</h1><p class="muted">Manage access, features, maintenance and activity.</p></div></div><div class="cards" id="adminStats"></div><div class="card" style="margin-top:14px"><h3>System controls</h3><div id="settingsBox"></div></div><div class="card" style="margin-top:14px"><h3>Users & permissions</h3><div class="table-wrap"><table class="table"><thead><tr><th>User</th><th>Role</th><th>Bot</th><th>Status</th><th>Usage</th><th>Actions</th></tr></thead><tbody id="users"></tbody></table></div></div><div class="card" style="margin-top:14px"><h3>Recent activity</h3><div class="table-wrap"><table class="table"><thead><tr><th>Time</th><th>User</th><th>Action</th><th>IP</th></tr></thead><tbody id="activity"></tbody></table></div></div>`;loadAdmin()}
+async function loadAdmin(){try{const [s,u,a,st]=await Promise.all([api("/api/admin/info"),api("/api/admin/users"),api("/api/admin/activity"),api("/api/admin/settings")]);$("#adminStats").innerHTML=`<div class="card stat"><div class="label">Users</div><div class="num">${s.users}</div></div><div class="card stat"><div class="label">Active</div><div class="num">${s.active_users}</div></div><div class="card stat"><div class="label">Exports</div><div class="num">${s.exports}</div></div><div class="card stat"><div class="label">Uptime</div><div class="num">${Math.floor(s.uptime_seconds/3600)}h</div></div>`;$("#settingsBox").innerHTML=`<div class="switch"><span>Maintenance mode</span><input type="checkbox" ${st.maintenance?"checked":""} onchange="saveSettings()"></div><div class="field"><label>Maintenance message</label><input id="maintMsg" value="${esc(st.maintenance_message)}"></div>${Object.entries(st.features).map(([k,v])=>`<div class="switch"><span>${k}</span><input data-feature="${k}" type="checkbox" ${v?"checked":""}></div>`).join("")}<button class="primary" style="width:auto;margin-top:8px" onclick="saveSettings()">Save system settings</button>`;$("#users").innerHTML=u.users.map(x=>`<tr><td>${esc(x.email)}</td><td><span class="badge">${x.role}</span></td><td>${x.bot_access?"<span class='badge green'>Allowed</span>":"<span class='badge'>Off</span>"}</td><td>${x.banned?"<span class='badge red'>Banned</span>":"<span class='badge green'>Active</span>"}</td><td>${x.usage_count}</td><td><button class="toolbar" onclick="userAction(${x.id},'bot_access',${!x.bot_access})">${x.bot_access?"Revoke bot":"Give bot"}</button><button class="toolbar" onclick="userAction(${x.id},'banned',${!x.banned})">${x.banned?"Unban":"Ban"}</button></td></tr>`).join("");$("#activity").innerHTML=a.activity.map(x=>`<tr><td>${new Date(x.created_at).toLocaleString()}</td><td>${esc(x.email||"—")}</td><td>${esc(x.action)}</td><td>${esc(x.ip||"—")}</td></tr>`).join("")}catch(e){toast(e.message)}}
+async function userAction(id,key,val){try{await api("/api/admin/users/"+id,{method:"PATCH",body:JSON.stringify({[key]:val})});toast("Permission updated");loadAdmin()}catch(e){toast(e.message)}}
+async function saveSettings(){const f={};document.querySelectorAll("[data-feature]").forEach(x=>f[x.dataset.feature]=x.checked);const maintenance=document.querySelector("#settingsBox input[type=checkbox]").checked;try{await api("/api/admin/settings",{method:"PATCH",body:JSON.stringify({maintenance,maintenance_message:$("#maintMsg").value,features:f})});toast("System settings saved");}catch(e){toast(e.message)}}
+function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]))}
+async function logout(){await api("/api/auth/logout",{method:"POST"}).catch(()=>{});me=null;csrf="";renderAuth("login")}
+boot();
+</script></body></html>"""
 
-async def http_info(request: web.Request) -> web.Response:
+async def http_info_v2(request):
     return web.json_response({
-        "service": "photo-studio-pro",
-        "version": "3.0",
-        "uptime_seconds": round(time.time() - _started_at, 1),
-        "telegram_configured": bool(BOT_TOKEN),
-        "rembg_enabled": USE_REMBG,
-        "generation_concurrency": GENERATION_CONCURRENCY,
-        "generations_completed": _generation_count,
-        "users": db_user_count(),
-        "maintenance_mode": db_get_setting("maintenance_mode", "0") == "1",
+        "service":"photoforge","version":"3.0","uptime_seconds":round(time.time()-_started_at,1),
+        "telegram_configured":bool(BOT_TOKEN),"maintenance":setting("maintenance","0")=="1",
+        "generations_completed":_generation_count
     })
-
-
-async def http_health(request: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "service": "photo-studio-pro"})
-
 
 async def start_web_server() -> web.AppRunner:
-    app = web.Application(client_max_size=MAX_IMAGE_BYTES + 5 * 1024 * 1024)
-    # Public
-    app.router.add_get("/", http_index)
-    app.router.add_get("/health", http_health)
-    app.router.add_get("/healthz", http_health)
-    app.router.add_get("/api/info", http_info)
-    app.router.add_get("/api/settings/public", http_settings_public)
-    app.router.add_get("/favicon.ico", http_favicon)
-    # Auth
-    app.router.add_post("/api/auth/register", http_auth_register)
-    app.router.add_post("/api/auth/login", http_auth_login)
-    app.router.add_get("/api/auth/me", http_auth_me)
-    app.router.add_post("/api/auth/logout", http_auth_logout)
-    # Account
-    app.router.add_post("/api/account/update", http_account_update)
-    app.router.add_post("/api/account/password", http_account_password)
-    app.router.add_get("/api/my/activity", http_my_activity)
-    app.router.add_get("/api/stats", http_stats)
-    # Editor
-    app.router.add_post("/api/editor/upload", http_editor_upload)
-    app.router.add_get("/api/editor/image/{token}", http_editor_image)
-    app.router.add_post("/api/editor/process", http_editor_process)
-    app.router.add_post("/api/editor/filters", http_editor_filters)
-    app.router.add_post("/api/editor/export", http_editor_export)
-    # Passport
-    app.router.add_post("/api/passport/generate", http_passport_generate)
-    # Admin
-    app.router.add_get("/api/admin/users", http_admin_users)
-    app.router.add_post("/api/admin/toggle-bot", http_admin_toggle_bot)
-    app.router.add_post("/api/admin/toggle-ban", http_admin_toggle_ban)
-    app.router.add_post("/api/admin/toggle-admin", http_admin_toggle_admin)
-    app.router.add_get("/api/admin/activity", http_admin_activity)
-    app.router.add_get("/api/admin/features", http_admin_features_get)
-    app.router.add_put("/api/admin/features", http_admin_features_put)
-    app.router.add_get("/api/admin/settings", http_admin_settings_get)
-    app.router.add_put("/api/admin/settings", http_admin_settings_put)
-    # Telegram Mini App (preserved)
-    app.router.add_post("/api/generate", http_mini_generate)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    log.info("HTTP server listening on port %s", PORT)
+    app=web.Application(client_max_size=MAX_IMAGE_BYTES + 2*1024*1024)
+    app.router.add_get("/",http_index)
+    app.router.add_get("/health",http_health)
+    app.router.add_get("/healthz",http_health)
+    app.router.add_get("/api/info",http_info_v2)
+    app.router.add_get("/api/auth/me",http_auth_me)
+    app.router.add_post("/api/auth/register",http_register)
+    app.router.add_post("/api/auth/login",http_login)
+    app.router.add_post("/api/auth/logout",http_logout)
+    app.router.add_post("/api/editor/process",http_editor_process)
+    app.router.add_post("/api/print/process",http_print_process)
+    app.router.add_get("/api/admin/info",http_admin_info)
+    app.router.add_get("/api/admin/users",http_admin_users)
+    app.router.add_patch("/api/admin/users/{id}",http_admin_user_update)
+    app.router.add_get("/api/admin/activity",http_admin_activity)
+    app.router.add_get("/api/admin/settings",http_admin_settings)
+    app.router.add_patch("/api/admin/settings",http_admin_settings)
+    app.router.add_get("/favicon.ico",http_favicon)
+    runner=web.AppRunner(app); await runner.setup()
+    site=web.TCPSite(runner,"0.0.0.0",PORT); await site.start()
+    log.info("Premium web server listening on port %s",PORT)
     return runner
-
 
 # --------------------------------------------------------------------------- #
 # Entrypoint
 # --------------------------------------------------------------------------- #
 
 async def main() -> None:
-    init_db()
-    runner = await start_web_server()
+    runner=await start_web_server()
     if not BOT_TOKEN:
-        log.error("BOT_TOKEN is not set; running in web-only mode. "
-                  "Set BOT_TOKEN to enable Telegram polling.")
-        try:
-            await asyncio.Event().wait()
-        finally:
-            await runner.cleanup()
+        log.error("BOT_TOKEN is not set; running in web-only mode.")
+        try: await asyncio.Event().wait()
+        finally: await runner.cleanup()
         return
-
-    bot = Bot(token=BOT_TOKEN,
-              default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot=Bot(token=BOT_TOKEN,default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     global _bot
-    _bot = bot
-    dp = Dispatcher(storage=MemoryStorage())
+    _bot=bot
+    dp=Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        await asyncio.sleep(5)
-        log.info("Bot started (rembg enabled: %s)", USE_REMBG)
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        await asyncio.sleep(2)
+        log.info("Bot started (rembg enabled: %s)",USE_REMBG)
+        await dp.start_polling(bot,allowed_updates=dp.resolve_used_update_types())
     finally:
-        await runner.cleanup()
-        await bot.session.close()
+        await runner.cleanup(); await bot.session.close()
 
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+if __name__=="__main__":
+    logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    try: asyncio.run(main())
+    except (KeyboardInterrupt,SystemExit): pass
